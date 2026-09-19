@@ -20,19 +20,47 @@ Elite Dangerous Market Connector (EDMC) plugin that posts to a Discord channel w
 ## Requirements
 
 - Elite Dangerous (PC) with a fleet and/or squadron carrier
-- [EDMarketConnector](https://github.com/EDCD/EDMarketConnector)
+- [EDMarketConnector](https://github.com/EDCD/EDMarketConnector) on **Windows, Linux, or macOS**
 - Either:
   - A Discord channel webhook URL, **or**
   - A Discord bot token and channel ID
 
+This plugin is pure Python and uses only EDMC's cross-platform plugin APIs, so it works the same on Linux as on Windows.
+
 ## Install
 
-1. Clone or download this repository into your EDMC plugins directory:
-   - Windows: `%LOCALAPPDATA%\EDMarketConnector\plugins`
-   - Or in EDMC: **File → Settings → Plugins → Open**
+1. Put this repository folder into your EDMC plugins directory (easiest: in EDMC use **File → Settings → Plugins → Open**).
+
+   Default plugin locations:
+
+   | OS | Plugins folder |
+   |---|---|
+   | Windows | `%LOCALAPPDATA%\EDMarketConnector\plugins` |
+   | Linux | `~/.local/share/EDMarketConnector/plugins` (or `$XDG_DATA_HOME/EDMarketConnector/plugins` if set) |
+   | macOS | `~/Library/Application Support/EDMarketConnector/plugins` |
+
 2. Ensure the folder is named `EDMC-CarrierJumpDiscord` and contains `load.py`.
+
+   Example on Linux:
+
+   ```bash
+   git clone https://github.com/SteveDAC/EDMC-CarrierJumpDiscord.git \
+     ~/.local/share/EDMarketConnector/plugins/EDMC-CarrierJumpDiscord
+   ```
+
 3. Restart EDMC.
 4. Confirm **Carrier Jump Discord** appears under Plugins.
+
+### Linux notes
+
+- EDMC must be able to read your Elite Dangerous journal files. If you play via Steam Play / Proton, journals are commonly under:
+
+  ```text
+  ~/.steam/steam/steamapps/compatdata/359320/pfx/drive_c/users/steamuser/Saved Games/Frontier Developments/Elite Dangerous
+  ```
+
+  Point **Settings → Configuration → E:D journal file location** at that folder if EDMC does not find journals automatically. See the [EDMC Installation & Setup wiki](https://github.com/EDCD/EDMarketConnector/wiki/Installation-&-Setup) for details.
+- Discord setup (webhook or bot) is identical on Linux; no extra Linux-specific Discord steps are required.
 
 ## Configure
 
