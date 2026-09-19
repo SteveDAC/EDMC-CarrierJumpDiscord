@@ -2,7 +2,7 @@
 EDMC-CarrierJumpDiscord
 
 Publishes fleet carrier and squadron carrier jump schedule, cancel, and
-optional arrival events to a Discord webhook.
+optional arrival events to Discord via webhook or bot token.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from config import appname, config
 # ---------------------------------------------------------------------------
 
 PLUGIN_NAME = "Carrier Jump Discord"
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 plugin_name = os.path.basename(os.path.dirname(__file__))
 logger = logging.getLogger(f"{appname}.{plugin_name}")
@@ -46,6 +46,9 @@ if not logger.hasHandlers():
 # ---------------------------------------------------------------------------
 
 CFG_WEBHOOK = "edmc_cjd_webhook_url"
+CFG_DELIVERY_MODE = "edmc_cjd_delivery_mode"
+CFG_BOT_TOKEN = "edmc_cjd_bot_token"
+CFG_CHANNEL_ID = "edmc_cjd_channel_id"
 CFG_ENABLED = "edmc_cjd_enabled"
 CFG_NOTIFY_REQUEST = "edmc_cjd_notify_request"
 CFG_NOTIFY_CANCEL = "edmc_cjd_notify_cancel"
@@ -58,10 +61,16 @@ CFG_SQUADRON_CALLSIGN = "edmc_cjd_squadron_callsign"
 CFG_MENTION = "edmc_cjd_mention"
 CFG_CARRIERS_JSON = "edmc_cjd_carriers_json"
 
+DELIVERY_WEBHOOK = "webhook"
+DELIVERY_BOT = "bot"
+DISCORD_API_BASE = "https://discord.com/api/v10"
+
 WEBHOOK_RE = re.compile(
     r"^https://(?:discord(?:app)?\.com|discord\.com)/api/webhooks/\d+/[\w-]+$",
     re.IGNORECASE,
 )
+CHANNEL_ID_RE = re.compile(r"^\d{15,25}$")
+BOT_TOKEN_RE = re.compile(r"^[\w-]+\.[\w-]+\.[\w-]+$")
 
 # Typical fleet/squadron carrier pad lockdown is ~3m20s before departure.
 LOCKDOWN_BEFORE_DEPARTURE = timedelta(minutes=3, seconds=20)
@@ -81,6 +90,9 @@ KIND_LABELS = {
 # ---------------------------------------------------------------------------
 
 _webhook_var: Optional[tk.StringVar] = None
+_delivery_mode_var: Optional[tk.StringVar] = None
+_bot_token_var: Optional[tk.StringVar] = None
+_channel_id_var: Optional[tk.StringVar] = None
 _enabled_var: Optional[tk.BooleanVar] = None
 _notify_request_var: Optional[tk.BooleanVar] = None
 _notify_cancel_var: Optional[tk.BooleanVar] = None
@@ -399,30 +411,118 @@ def _discord_session():
         return requests.Session()
 
 
-def _post_discord(payload: dict[str, Any]) -> tuple[bool, str]:
+def _delivery_mode() -> str:
+    mode = _config_str(CFG_DELIVERY_MODE, DELIVERY_WEBHOOK).strip().lower()
+    if mode == DELIVERY_BOT:
+        return DELIVERY_BOT
+    return DELIVERY_WEBHOOK
+
+
+def _delivery_configured() -> tuple[bool, str]:
+    """Return (ok, user-facing reason/status)."""
+    mode = _delivery_mode()
+    if mode == DELIVERY_BOT:
+        token = _config_str(CFG_BOT_TOKEN).strip()
+        channel_id = _config_str(CFG_CHANNEL_ID).strip()
+        if not token:
+            return False, "Bot token missing"
+        if not BOT_TOKEN_RE.match(token):
+            return False, "Bot token looks invalid"
+        if not channel_id:
+            return False, "Channel ID missing"
+        if not CHANNEL_ID_RE.match(channel_id):
+            return False, "Channel ID looks invalid"
+        return True, "Bot ready"
+
+    webhook = _config_str(CFG_WEBHOOK).strip()
+    if not webhook:
+        return False, "Webhook missing"
+    if not WEBHOOK_RE.match(webhook):
+        return False, "Webhook URL looks invalid"
+    return True, "Webhook ready"
+
+
+def _refresh_ready_status() -> None:
+    if not _config_bool(CFG_ENABLED, True):
+        _set_status("Disabled", "orange")
+        return
+    ok, message = _delivery_configured()
+    if not ok:
+        _set_status(message, "orange")
+    elif _carriers:
+        _set_status(f"Tracking {len(_carriers)} carrier(s)", "green")
+    else:
+        _set_status("Ready", "green")
+
+
+def _post_via_webhook(payload: dict[str, Any]) -> tuple[bool, str]:
     webhook = _config_str(CFG_WEBHOOK).strip()
     if not webhook:
         return False, "Discord webhook URL is not configured"
-
     if not WEBHOOK_RE.match(webhook):
         return False, "Discord webhook URL looks invalid"
 
+    session = _discord_session()
+    response = session.post(
+        webhook,
+        data=json.dumps(payload),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": f"EDMC-{plugin_name}/{__version__}",
+        },
+        timeout=15,
+    )
+    if 200 <= response.status_code < 300:
+        return True, "Posted to Discord (webhook)"
+    return False, f"Discord webhook HTTP {response.status_code}: {response.text[:200]}"
+
+
+def _post_via_bot(payload: dict[str, Any]) -> tuple[bool, str]:
+    token = _config_str(CFG_BOT_TOKEN).strip()
+    channel_id = _config_str(CFG_CHANNEL_ID).strip()
+    if not token:
+        return False, "Discord bot token is not configured"
+    if not BOT_TOKEN_RE.match(token):
+        return False, "Discord bot token looks invalid"
+    if not channel_id:
+        return False, "Discord channel ID is not configured"
+    if not CHANNEL_ID_RE.match(channel_id):
+        return False, "Discord channel ID looks invalid"
+
+    # Bot messages use the bot's own name/avatar; username is webhook-only.
+    bot_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in ("username", "avatar_url")
+    }
+
+    session = _discord_session()
+    response = session.post(
+        f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
+        data=json.dumps(bot_payload),
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": f"EDMC-{plugin_name}/{__version__}",
+        },
+        timeout=15,
+    )
+    if 200 <= response.status_code < 300:
+        return True, "Posted to Discord (bot)"
+    return False, f"Discord bot HTTP {response.status_code}: {response.text[:200]}"
+
+
+def _post_discord(payload: dict[str, Any]) -> tuple[bool, str]:
+    ok, message = _delivery_configured()
+    if not ok:
+        return False, message
+
     try:
-        session = _discord_session()
-        response = session.post(
-            webhook,
-            data=json.dumps(payload),
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": f"EDMC-{plugin_name}/{__version__}",
-            },
-            timeout=15,
-        )
-        if 200 <= response.status_code < 300:
-            return True, "Posted to Discord"
-        return False, f"Discord HTTP {response.status_code}: {response.text[:200]}"
+        if _delivery_mode() == DELIVERY_BOT:
+            return _post_via_bot(payload)
+        return _post_via_webhook(payload)
     except Exception as exc:
-        logger.exception("Discord webhook request failed")
+        logger.exception("Discord request failed")
         return False, f"Discord request failed: {exc}"
 
 
@@ -451,10 +551,10 @@ def _enqueue_discord(payload: dict[str, Any]) -> None:
         _set_status("Disabled", "orange")
         return
 
-    webhook = _config_str(CFG_WEBHOOK).strip()
-    if not webhook:
-        logger.warning("No Discord webhook configured")
-        _set_status("Webhook missing", "orange")
+    ok, message = _delivery_configured()
+    if not ok:
+        logger.warning("Discord delivery not configured: %s", message)
+        _set_status(message, "orange")
         return
 
     _worker_queue.put(payload)
@@ -675,25 +775,22 @@ def plugin_app(parent: tk.Frame) -> tuple[tk.Label, tk.Label]:
     global _status_label
     label = tk.Label(parent, text="Carrier Discord:")
     _status_label = tk.Label(parent, text="Ready", anchor=tk.W)
-    if not _config_str(CFG_WEBHOOK).strip():
-        _set_status("Webhook missing", "orange")
-    elif not _config_bool(CFG_ENABLED, True):
-        _set_status("Disabled", "orange")
-    elif _carriers:
-        _set_status(f"Tracking {len(_carriers)} carrier(s)", "green")
-    else:
-        _set_status("Ready", "green")
+    _refresh_ready_status()
     return label, _status_label
 
 
 def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
-    """Settings tab for Discord webhook and notification options."""
-    global _webhook_var, _enabled_var, _notify_request_var, _notify_cancel_var
+    """Settings tab for Discord delivery and notification options."""
+    global _webhook_var, _delivery_mode_var, _bot_token_var, _channel_id_var
+    global _enabled_var, _notify_request_var, _notify_cancel_var
     global _notify_arrival_var, _fleet_name_var, _fleet_callsign_var
     global _squadron_name_var, _squadron_callsign_var, _mention_var
     global _prefs_status, _tracked_label
 
     _webhook_var = tk.StringVar(value=_config_str(CFG_WEBHOOK))
+    _delivery_mode_var = tk.StringVar(value=_delivery_mode())
+    _bot_token_var = tk.StringVar(value=_config_str(CFG_BOT_TOKEN))
+    _channel_id_var = tk.StringVar(value=_config_str(CFG_CHANNEL_ID))
     _enabled_var = tk.BooleanVar(value=_config_bool(CFG_ENABLED, True))
     _notify_request_var = tk.BooleanVar(value=_config_bool(CFG_NOTIFY_REQUEST, True))
     _notify_cancel_var = tk.BooleanVar(value=_config_bool(CFG_NOTIFY_CANCEL, True))
@@ -741,12 +838,50 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
     ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
 
     row += 1
+    nb.Label(frame, text="Delivery method").grid(
+        row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(10, 2)
+    )
+    row += 1
+    mode_row = nb.Frame(frame)
+    mode_row.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
+    nb.Radiobutton(
+        mode_row,
+        text="Webhook URL",
+        variable=_delivery_mode_var,
+        value=DELIVERY_WEBHOOK,
+    ).grid(row=0, column=0, sticky=tk.W, padx=(0, 12))
+    nb.Radiobutton(
+        mode_row,
+        text="Bot token + channel ID",
+        variable=_delivery_mode_var,
+        value=DELIVERY_BOT,
+    ).grid(row=0, column=1, sticky=tk.W)
+
+    row += 1
     nb.Label(frame, text="Discord webhook URL").grid(
         row=row, column=0, sticky=tk.W, padx=10, pady=(10, 2)
     )
     row += 1
     ttk.Entry(frame, textvariable=_webhook_var, width=70).grid(
         row=row, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=2
+    )
+
+    row += 1
+    nb.Label(frame, text="Discord bot token").grid(
+        row=row, column=0, sticky=tk.W, padx=10, pady=(10, 2)
+    )
+    row += 1
+    ttk.Entry(frame, textvariable=_bot_token_var, width=70, show="*").grid(
+        row=row, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=2
+    )
+
+    row += 1
+    nb.Label(frame, text="Discord channel ID").grid(
+        row=row, column=0, sticky=tk.W, padx=10, pady=(8, 2)
+    )
+    row += 1
+    ttk.Entry(frame, textvariable=_channel_id_var, width=40).grid(
+        row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2
     )
 
     row += 1
@@ -828,7 +963,8 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
         frame,
         text=(
             "Tip: open management for each carrier in-game once so names/callsigns "
-            "are learned separately. Personal and squadron carriers are tracked by ID."
+            "are learned separately. For bot mode, invite a bot with Send Messages + "
+            "Embed Links, then paste its token and the target channel ID."
         ),
         wraplength=560,
         justify=tk.LEFT,
@@ -837,10 +973,19 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
     return frame
 
 
-def prefs_changed(cmdr: str, is_beta: bool) -> None:
-    """Persist settings when the preferences dialog is closed."""
+def _persist_prefs_from_vars() -> None:
+    """Write current prefs widget values into EDMC config."""
     if _webhook_var is not None:
         config.set(CFG_WEBHOOK, _webhook_var.get().strip())
+    if _delivery_mode_var is not None:
+        mode = _delivery_mode_var.get().strip().lower()
+        if mode not in (DELIVERY_WEBHOOK, DELIVERY_BOT):
+            mode = DELIVERY_WEBHOOK
+        config.set(CFG_DELIVERY_MODE, mode)
+    if _bot_token_var is not None:
+        config.set(CFG_BOT_TOKEN, _bot_token_var.get().strip())
+    if _channel_id_var is not None:
+        config.set(CFG_CHANNEL_ID, _channel_id_var.get().strip())
     if _enabled_var is not None:
         config.set(CFG_ENABLED, bool(_enabled_var.get()))
     if _notify_request_var is not None:
@@ -860,32 +1005,17 @@ def prefs_changed(cmdr: str, is_beta: bool) -> None:
     if _mention_var is not None:
         config.set(CFG_MENTION, _mention_var.get().strip())
 
-    _refresh_tracked_label()
 
-    if not _config_str(CFG_WEBHOOK).strip():
-        _set_status("Webhook missing", "orange")
-    elif not _config_bool(CFG_ENABLED, True):
-        _set_status("Disabled", "orange")
-    elif _carriers:
-        _set_status(f"Tracking {len(_carriers)} carrier(s)", "green")
-    else:
-        _set_status("Ready", "green")
+def prefs_changed(cmdr: str, is_beta: bool) -> None:
+    """Persist settings when the preferences dialog is closed."""
+    _persist_prefs_from_vars()
+    _refresh_tracked_label()
+    _refresh_ready_status()
 
 
 def _send_test_message() -> None:
     """Post a sample embed using the values currently shown in prefs."""
-    if _webhook_var is not None:
-        config.set(CFG_WEBHOOK, _webhook_var.get().strip())
-    if _mention_var is not None:
-        config.set(CFG_MENTION, _mention_var.get().strip())
-    if _fleet_name_var is not None:
-        config.set(CFG_CARRIER_NAME, _fleet_name_var.get().strip())
-    if _fleet_callsign_var is not None:
-        config.set(CFG_CARRIER_CALLSIGN, _fleet_callsign_var.get().strip())
-    if _squadron_name_var is not None:
-        config.set(CFG_SQUADRON_NAME, _squadron_name_var.get().strip())
-    if _squadron_callsign_var is not None:
-        config.set(CFG_SQUADRON_CALLSIGN, _squadron_callsign_var.get().strip())
+    _persist_prefs_from_vars()
 
     # Prefer a known fleet carrier for the test, else any tracked carrier.
     test_id = None
@@ -927,10 +1057,11 @@ def _send_test_message() -> None:
     )
     if temporary:
         _carriers.pop(test_id, None)
+    mode = _delivery_mode()
     payload["embeds"][0]["title"] = "Carrier jump scheduled (TEST)"
     payload["embeds"][0]["description"] = (
-        f"Test message from **{PLUGIN_NAME}**. "
-        f"If you see this, the webhook is working."
+        f"Test message from **{PLUGIN_NAME}** via **{mode}**. "
+        f"If you see this, Discord delivery is working."
     )
 
     ok, message = _post_discord(payload)
