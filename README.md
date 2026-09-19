@@ -12,6 +12,7 @@ Elite Dangerous Market Connector (EDMC) plugin that posts to a Discord channel w
 - Learns name / callsign / type from `CarrierStats`, `CarrierNameChanged`, and `CarrierBuy`
 - Remembers tracked carriers across EDMC restarts
 - Posts a concise Discord embed with carrier, type, route, body, and timing
+- Uses Discord dynamic timestamps so departure/lockdown times show in each viewer's local timezone
 - Sends Discord HTTP requests on a background thread so EDMC stays responsive
 - Settings tab with webhook URL, toggles, dual carrier overrides, and a **Send test message** button
 
@@ -59,7 +60,9 @@ EDMC-CarrierJumpDiscord/
   README.md
 ```
 
-Plugin version is `__version__` in `load.py` (`1.2.1`).
+Plugin version is `__version__` in `load.py` (`1.3.0`).
+
+Times in Discord posts use Discord's `<t:unix:f>` / `<t:unix:R>` markup, so each viewer sees local date/time plus a relative countdown (for example "in 15 minutes").
 
 Arrival notifications are off by default. Enable **Notify on jump arrival** in settings. Arrival posts only when the journal `CarrierJump` event matches a tracked carrier (by Carrier ID, callsign, or a pending jump to that system), so hitchhiking on an unrelated carrier should not notify.
 

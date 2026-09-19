@@ -27,7 +27,7 @@ from config import appname, config
 # ---------------------------------------------------------------------------
 
 PLUGIN_NAME = "Carrier Jump Discord"
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 plugin_name = os.path.basename(os.path.dirname(__file__))
 logger = logging.getLogger(f"{appname}.{plugin_name}")
@@ -145,10 +145,18 @@ def _parse_journal_time(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _format_utc(dt: Optional[datetime]) -> str:
+def _format_discord_time(dt: Optional[datetime]) -> Optional[str]:
+    """Format a time with Discord dynamic timestamps.
+
+    Discord renders <t:unix:style> in each viewer's local timezone.
+    Styles used:
+      f - short date/time (e.g. 19 September 2026 12:46)
+      R - relative (e.g. in 15 minutes)
+    """
     if dt is None:
-        return "Unknown"
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        return None
+    unix = int(dt.timestamp())
+    return f"<t:{unix}:f> (<t:{unix}:R>)"
 
 
 def _normalize_carrier_id(value: Any) -> Optional[int]:
@@ -490,8 +498,8 @@ def _build_jump_request_payload(
         _embed_field("From", from_system or "Unknown"),
         _embed_field("Destination", destination),
         _embed_field("Body", body),
-        _embed_field("Departure", _format_utc(departure)),
-        _embed_field("Lockdown (approx)", _format_utc(lockdown)),
+        _embed_field("Departure", _format_discord_time(departure)),
+        _embed_field("Lockdown (approx)", _format_discord_time(lockdown)),
     )
 
     mention = _config_str(CFG_MENTION).strip()
@@ -522,9 +530,9 @@ def _build_jump_cancelled_payload(carrier_id: Optional[int]) -> dict[str, Any]:
     if pending:
         pending_dest = pending.get("SystemName")
         pending_body = pending.get("Body")
-        pending_departure = _format_utc(_parse_journal_time(pending.get("DepartureTime")))
-        if pending_departure == "Unknown":
-            pending_departure = None
+        pending_departure = _format_discord_time(
+            _parse_journal_time(pending.get("DepartureTime"))
+        )
 
     display = _carrier_display(carrier_id)
     fields = _carrier_fields(carrier_id) + _collect_fields(
