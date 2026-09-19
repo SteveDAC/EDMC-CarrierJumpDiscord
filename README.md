@@ -20,12 +20,12 @@ Elite Dangerous Market Connector (EDMC) plugin that posts to a Discord channel w
 ## Requirements
 
 - Elite Dangerous (PC) with a fleet and/or squadron carrier
-- [EDMarketConnector](https://github.com/EDCD/EDMarketConnector) on **Windows, Linux, or macOS**
+- [EDMarketConnector](https://github.com/EDCD/EDMarketConnector) on **Windows or Linux**
 - Either:
   - A Discord channel webhook URL, **or**
   - A Discord bot token and channel ID
 
-This plugin is pure Python and uses only EDMC's cross-platform plugin APIs, so it works the same on Linux as on Windows.
+This plugin is pure Python and uses only EDMC's plugin APIs, so it works the same on Linux as on Windows. macOS is not supported.
 
 ## Install
 
@@ -45,7 +45,6 @@ Default plugin locations:
 |---|---|
 | Windows | `%LOCALAPPDATA%\EDMarketConnector\plugins` |
 | Linux | `~/.local/share/EDMarketConnector/plugins` (or `$XDG_DATA_HOME/EDMarketConnector/plugins` if set) |
-| macOS | `~/Library/Application Support/EDMarketConnector/plugins` |
 
 ### From Git (optional)
 
