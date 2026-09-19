@@ -29,27 +29,32 @@ This plugin is pure Python and uses only EDMC's cross-platform plugin APIs, so i
 
 ## Install
 
-1. Put this repository folder into your EDMC plugins directory (easiest: in EDMC use **File → Settings → Plugins → Open**).
+### From a release (recommended)
 
-   Default plugin locations:
+1. Download the latest `EDMC-CarrierJumpDiscord-vX.Y.Z.zip` from
+   [Releases](https://github.com/SteveDAC/EDMC-CarrierJumpDiscord/releases).
+2. In EDMC open **File → Settings → Plugins → Open**.
+3. Extract the zip so you get a folder named `EDMC-CarrierJumpDiscord` containing `load.py`
+   directly inside the plugins directory (not nested an extra level).
+4. Restart EDMC.
+5. Confirm **Carrier Jump Discord** appears under Plugins.
 
-   | OS | Plugins folder |
-   |---|---|
-   | Windows | `%LOCALAPPDATA%\EDMarketConnector\plugins` |
-   | Linux | `~/.local/share/EDMarketConnector/plugins` (or `$XDG_DATA_HOME/EDMarketConnector/plugins` if set) |
-   | macOS | `~/Library/Application Support/EDMarketConnector/plugins` |
+Default plugin locations:
 
-2. Ensure the folder is named `EDMC-CarrierJumpDiscord` and contains `load.py`.
+| OS | Plugins folder |
+|---|---|
+| Windows | `%LOCALAPPDATA%\EDMarketConnector\plugins` |
+| Linux | `~/.local/share/EDMarketConnector/plugins` (or `$XDG_DATA_HOME/EDMarketConnector/plugins` if set) |
+| macOS | `~/Library/Application Support/EDMarketConnector/plugins` |
 
-   Example on Linux:
+### From Git (optional)
 
-   ```bash
-   git clone https://github.com/SteveDAC/EDMC-CarrierJumpDiscord.git \
-     ~/.local/share/EDMarketConnector/plugins/EDMC-CarrierJumpDiscord
-   ```
+```bash
+git clone https://github.com/SteveDAC/EDMC-CarrierJumpDiscord.git \
+  ~/.local/share/EDMarketConnector/plugins/EDMC-CarrierJumpDiscord
+```
 
-3. Restart EDMC.
-4. Confirm **Carrier Jump Discord** appears under Plugins.
+On Windows, clone into `%LOCALAPPDATA%\EDMarketConnector\plugins\EDMC-CarrierJumpDiscord` instead, then restart EDMC.
 
 ### Linux notes
 
