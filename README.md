@@ -109,7 +109,9 @@ EDMC-CarrierJumpDiscord/
   README.md
 ```
 
-Plugin version is `__version__` in `load.py` (`1.4.0`).
+Plugin version is `__version__` in `load.py` (`1.4.1`).
+
+Repeat `CarrierJumpRequest` journal events for the same carrier and departure time are ignored so Discord is not spammed when the game re-emits a pending jump.
 
 Times in Discord posts use Discord's `<t:unix:f>` / `<t:unix:R>` markup, so each viewer sees local date/time plus a relative countdown (for example "in 15 minutes").
 

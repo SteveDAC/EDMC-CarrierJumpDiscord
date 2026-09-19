@@ -27,7 +27,7 @@ from config import appname, config
 # ---------------------------------------------------------------------------
 
 PLUGIN_NAME = "Carrier Jump Discord"
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 plugin_name = os.path.basename(os.path.dirname(__file__))
 logger = logging.getLogger(f"{appname}.{plugin_name}")
@@ -112,10 +112,31 @@ _current_system: Optional[str] = None
 _carriers: dict[int, dict[str, str]] = {}
 # carrier_id -> latest CarrierJumpRequest entry
 _pending_jumps: dict[int, dict[str, Any]] = {}
+# Deduplicate Discord posts when the game re-emits the same jump events.
+# carrier_id -> DepartureTime last announced as scheduled
+_last_notified_request: dict[int, str] = {}
+# carrier_id -> DepartureTime (or marker) last announced as cancelled
+_last_notified_cancel: dict[int, str] = {}
+# carrier_id -> "StarSystem|journal_timestamp" last announced as arrived
+_last_notified_arrival: dict[int, str] = {}
 
 _worker_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue()
 _worker_thread: Optional[threading.Thread] = None
 _stop_worker = threading.Event()
+
+
+def _is_duplicate_notification(
+    store: dict[int, str],
+    carrier_id: Optional[int],
+    token: Optional[str],
+) -> bool:
+    """Return True if we already notified for this carrier_id + token."""
+    if carrier_id is None or not token:
+        return False
+    if store.get(carrier_id) == token:
+        return True
+    store[carrier_id] = token
+    return False
 
 
 def _config_bool(key: str, default: bool = True) -> bool:
@@ -1105,21 +1126,32 @@ def journal_entry(
 
         if carrier_id is not None:
             _pending_jumps[carrier_id] = dict(entry)
+            # A new schedule supersedes any prior cancel/arrival dedupe for this carrier.
+            _last_notified_cancel.pop(carrier_id, None)
+            _last_notified_arrival.pop(carrier_id, None)
 
         from_system = _current_system or system
         destination = entry.get("SystemName", "Unknown")
+        departure = str(entry.get("DepartureTime") or "").strip()
         logger.info(
             "CarrierJumpRequest [%s]: %s -> %s at %s",
             carrier_id,
             from_system,
             destination,
-            entry.get("DepartureTime"),
+            departure or entry.get("DepartureTime"),
         )
         _set_status(f"Jump to {destination}", "cyan")
 
         if _config_bool(CFG_NOTIFY_REQUEST, True):
-            payload = _build_jump_request_payload(entry, from_system, carrier_id)
-            _enqueue_discord(payload)
+            if _is_duplicate_notification(_last_notified_request, carrier_id, departure):
+                logger.info(
+                    "Skipping duplicate CarrierJumpRequest notify for %s at %s",
+                    carrier_id,
+                    departure,
+                )
+            else:
+                payload = _build_jump_request_payload(entry, from_system, carrier_id)
+                _enqueue_discord(payload)
         return None
 
     if event == "CarrierJumpCancelled":
@@ -1130,15 +1162,29 @@ def journal_entry(
         except Exception:
             logger.exception("Failed updating carrier identity on jump cancel")
 
+        pending = _pending_jumps.get(carrier_id) if carrier_id is not None else None
+        cancel_token = str(
+            (pending or {}).get("DepartureTime")
+            or entry.get("timestamp")
+            or "cancelled"
+        ).strip()
+
         logger.info("CarrierJumpCancelled for CarrierID=%s", carrier_id)
         _set_status("Jump cancelled", "orange")
 
         if _config_bool(CFG_NOTIFY_CANCEL, True):
-            payload = _build_jump_cancelled_payload(carrier_id)
-            _enqueue_discord(payload)
+            if _is_duplicate_notification(_last_notified_cancel, carrier_id, cancel_token):
+                logger.info(
+                    "Skipping duplicate CarrierJumpCancelled notify for %s",
+                    carrier_id,
+                )
+            else:
+                payload = _build_jump_cancelled_payload(carrier_id)
+                _enqueue_discord(payload)
 
         if carrier_id is not None:
             _pending_jumps.pop(carrier_id, None)
+            _last_notified_request.pop(carrier_id, None)
         return None
 
     if event == "CarrierJump":
@@ -1164,12 +1210,21 @@ def journal_entry(
         logger.info("CarrierJump arrival [%s] in %s", carrier_id, arrived)
         _set_status(f"Arrived: {arrived}", "green")
 
+        arrival_token = f"{arrived}|{entry.get('timestamp') or ''}"
         if _config_bool(CFG_NOTIFY_ARRIVAL, False):
-            payload = _build_jump_arrival_payload(entry, carrier_id)
-            _enqueue_discord(payload)
+            if _is_duplicate_notification(_last_notified_arrival, carrier_id, arrival_token):
+                logger.info(
+                    "Skipping duplicate CarrierJump arrival notify for %s in %s",
+                    carrier_id,
+                    arrived,
+                )
+            else:
+                payload = _build_jump_arrival_payload(entry, carrier_id)
+                _enqueue_discord(payload)
 
         if carrier_id is not None:
             _pending_jumps.pop(carrier_id, None)
+            _last_notified_request.pop(carrier_id, None)
         return None
 
     return None
