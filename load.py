@@ -651,7 +651,7 @@ def _join_field_groups(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _refresh_expedition_ui() -> None:
     if _expedition is None:
         return
-    lines = _expedition.status_lines()
+    lines = _expedition.status_lines(current_system=_current_system)
     # When collapsed, keep a bit of route context on the header line.
     header_status = lines["status"]
     if _expedition_collapsed and lines["status"] == "Following route":
@@ -679,11 +679,13 @@ def _refresh_expedition_ui() -> None:
 def _expedition_field_group() -> list[dict[str, Any]]:
     if _expedition is None:
         return []
-    return _expedition.discord_fields()
+    return _expedition.discord_fields(current_system=_current_system)
 
 
 def _build_expedition_complete_payload(cmdr: Optional[str] = None) -> dict[str, Any]:
-    lines = _expedition.status_lines() if _expedition else {}
+    lines = (
+        _expedition.status_lines(current_system=_current_system) if _expedition else {}
+    )
     final_dest = lines.get("final") or "Unknown"
     display = "Expedition"
     fields = _join_field_groups(
@@ -709,7 +711,12 @@ def _build_expedition_complete_payload(cmdr: Optional[str] = None) -> dict[str, 
     }
 
 
-def _handle_expedition_progress(system: Optional[str], cmdr: Optional[str] = None) -> None:
+def _handle_expedition_progress(
+    system: Optional[str],
+    cmdr: Optional[str] = None,
+    *,
+    complete_on_final: bool = False,
+) -> None:
     """Advance expedition when a jump schedule/arrival matches the route."""
     if _expedition is None or not system:
         return
@@ -717,20 +724,25 @@ def _handle_expedition_progress(system: Optional[str], cmdr: Optional[str] = Non
         return
 
     before_completed = bool(_expedition.state.completed)
-    result = _expedition.advance_to_system(system)
-    if result.get("advanced"):
+    result = _expedition.advance_to_system(
+        system,
+        complete_on_final=complete_on_final,
+    )
+    if result.get("advanced") or result.get("completed"):
         nxt = _expedition.next_waypoint()
         logger.info(
-            "Expedition advanced via %s (next=%s completed=%s)",
+            "Expedition advanced via %s (next=%s completed=%s complete_on_final=%s)",
             system,
             nxt.system if nxt else None,
             result.get("completed"),
+            complete_on_final,
         )
         _set_status(
             "Expedition complete" if result.get("completed") else f"Route -> {system}",
             "green",
         )
-    if result.get("completed") and not before_completed:
+    # Only announce completion when the carrier has actually arrived.
+    if complete_on_final and result.get("completed") and not before_completed:
         _enqueue_discord(_build_expedition_complete_payload(cmdr=cmdr))
 
 
@@ -918,10 +930,13 @@ def _update_carrier_from_entry(entry: dict[str, Any]) -> Optional[int]:
 
 def _remember_system(entry: dict[str, Any], system: Optional[str]) -> None:
     global _current_system
+    previous = _current_system
     if entry.get("StarSystem"):
         _current_system = entry["StarSystem"]
     elif system:
         _current_system = system
+    if _current_system and _current_system != previous:
+        _refresh_expedition_ui()
 
 
 # ---------------------------------------------------------------------------
@@ -988,15 +1003,16 @@ def _import_expedition_csv() -> None:
         state = _expedition.import_csv(path, current_system=_current_system)
         hops = max(0, len(state.waypoints) - 1)
         final_dest = state.waypoints[-1].system if state.waypoints else "Unknown"
-        lines = _expedition.status_lines()
+        lines = _expedition.status_lines(current_system=_current_system)
         logger.info(
-            "Imported expedition route from %s (%d hops -> %s); status=%s next=%s progress=%s current=%s",
+            "Imported expedition route from %s (%d hops -> %s); status=%s next=%s progress=%s remaining=%s current=%s",
             path,
             hops,
             final_dest,
             lines.get("status"),
             lines.get("next"),
             lines.get("progress"),
+            lines.get("remaining"),
             _current_system,
         )
         if state.completed:
@@ -1494,7 +1510,8 @@ def journal_entry(
                 )
                 _enqueue_discord(payload)
 
-        _handle_expedition_progress(destination, cmdr=cmdr)
+        # Scheduling the final hop must not mark the expedition complete.
+        _handle_expedition_progress(destination, cmdr=cmdr, complete_on_final=False)
         return None
 
     if event == "CarrierJumpCancelled":
@@ -1554,7 +1571,8 @@ def journal_entry(
         _set_status(f"Arrived: {arrived}", "green")
 
         # Advance before arrival Discord so progress reflects this arrival.
-        _handle_expedition_progress(arrived, cmdr=cmdr)
+        # Completion is only allowed on actual arrival at the final system.
+        _handle_expedition_progress(arrived, cmdr=cmdr, complete_on_final=True)
 
         arrival_token = f"{arrived}|{entry.get('timestamp') or ''}"
         if _config_bool(CFG_NOTIFY_ARRIVAL, False):

@@ -424,22 +424,58 @@ class ExpeditionManager:
         # next_index 1 (pointing at first destination) => 0 hops completed.
         return max(0, min(self.state.next_index - 1, self.hops_total()))
 
-    def distance_remaining(self) -> Optional[float]:
-        nxt = self.next_waypoint()
-        if nxt and nxt.distance_remaining is not None:
-            return nxt.distance_remaining
-        # Fallback: sum remaining hop distances from next_index onward.
-        if not self.state.waypoints or self.state.next_index >= len(self.state.waypoints):
+    def _index_for_system(self, system: Optional[str]) -> Optional[int]:
+        if not system:
             return None
+        for idx, waypoint in enumerate(self.state.waypoints):
+            if _systems_match(waypoint.system, system):
+                return idx
+        return None
+
+    def _current_position_index(self, current_system: Optional[str] = None) -> Optional[int]:
+        """Best-known route index for where the carrier is right now."""
+        if not self.state.waypoints:
+            return None
+
+        matched = self._index_for_system(current_system)
+        if matched is not None:
+            return matched
+
+        # Fall back to the last completed waypoint (origin at start).
+        if self.state.next_index > 0:
+            return min(self.state.next_index - 1, len(self.state.waypoints) - 1)
+        return 0
+
+    def distance_remaining(self, current_system: Optional[str] = None) -> Optional[float]:
+        """
+        Distance left from the carrier's current system to the final destination.
+
+        Uses the current (or last reached) waypoint's Remaining value, not the
+        next hop's — a scheduled-but-not-completed jump should not zero this out.
+        """
+        if not self.state.waypoints:
+            return None
+        if self.state.completed:
+            return 0.0
+
+        idx = self._current_position_index(current_system)
+        if idx is None:
+            return None
+
+        waypoint = self.state.waypoints[idx]
+        if waypoint.distance_remaining is not None:
+            return waypoint.distance_remaining
+
+        # Fallback: sum hop distances after the current position.
         total = 0.0
         found = False
-        for waypoint in self.state.waypoints[self.state.next_index :]:
-            if waypoint.distance is not None:
-                total += waypoint.distance
+        for hop in self.state.waypoints[idx + 1 :]:
+            if hop.distance is not None:
+                total += hop.distance
                 found = True
         return total if found else None
 
-    def status_lines(self) -> dict[str, str]:
+    def status_lines(self, current_system: Optional[str] = None) -> dict[str, str]:
         if self.state.completed and self.state.waypoints:
             return {
                 "status": "Expedition complete",
@@ -458,7 +494,7 @@ class ExpeditionManager:
             }
 
         nxt = self.next_waypoint()
-        remaining = self.distance_remaining()
+        remaining = self.distance_remaining(current_system=current_system)
         remaining_text = f"{remaining:.1f} LY" if remaining is not None else "Unknown"
         return {
             "status": "Following route",
@@ -468,12 +504,12 @@ class ExpeditionManager:
             "remaining": remaining_text,
         }
 
-    def discord_fields(self) -> list[dict[str, Any]]:
+    def discord_fields(self, current_system: Optional[str] = None) -> list[dict[str, Any]]:
         """Embed fields describing expedition context."""
         if not self.is_active and not (self.state.completed and self.state.waypoints):
             return []
 
-        lines = self.status_lines()
+        lines = self.status_lines(current_system=current_system)
         nxt = self.next_waypoint()
         fields = [
             {"name": "Expedition", "value": lines["status"], "inline": True},
@@ -492,12 +528,20 @@ class ExpeditionManager:
             )
         return fields
 
-    def advance_to_system(self, system: Optional[str]) -> dict[str, Any]:
+    def advance_to_system(
+        self,
+        system: Optional[str],
+        *,
+        complete_on_final: bool = True,
+    ) -> dict[str, Any]:
         """
         Mark progress when a schedule/arrival system matches a future waypoint.
 
-        Returns a result dict:
-          matched, advanced, completed, waypoint
+        complete_on_final:
+          True  — arrival (or explicit completion): finishing the last system
+                  completes the expedition.
+          False — jump schedule only: never complete on the final hop; wait
+                  until the carrier actually arrives.
         """
         result = {
             "matched": False,
@@ -531,13 +575,30 @@ class ExpeditionManager:
         if match_idx < self.state.next_index:
             return result
 
+        final_idx = len(self.state.waypoints) - 1
+
+        # Scheduling (or otherwise noting) the final system must not complete
+        # the expedition until we actually arrive there.
+        if match_idx >= final_idx and not complete_on_final:
+            old_next = self.state.next_index
+            for idx, waypoint in enumerate(self.state.waypoints):
+                waypoint.done = idx < final_idx
+            self.state.next_index = final_idx
+            self.state.completed = False
+            self.state.active = True
+            if self.state.next_index != old_next:
+                result["advanced"] = True
+                self.save()
+                self._notify()
+            return result
+
         # Reaching waypoint N means all before it are done, and next is N+1.
         new_next = match_idx + 1
         if new_next >= len(self.state.waypoints):
-            # Reached final destination.
+            # Arrived at final destination.
             for waypoint in self.state.waypoints:
                 waypoint.done = True
-            self.state.next_index = len(self.state.waypoints) - 1
+            self.state.next_index = final_idx
             self.state.completed = True
             self.state.active = False
             result["advanced"] = True
