@@ -9,3 +9,5 @@ Thumbs.db
 *.egg-info/
 .venv/
 venv/
+.cursor/
+.vscode/
