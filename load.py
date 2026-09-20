@@ -48,7 +48,7 @@ def plugin_name_guess() -> str:
 # ---------------------------------------------------------------------------
 
 PLUGIN_NAME = "Carrier Jump Discord"
-__version__ = "1.5.0-dev"
+__version__ = "1.5.0"
 
 plugin_name = os.path.basename(os.path.dirname(__file__))
 logger = logging.getLogger(f"{appname}.{plugin_name}")
