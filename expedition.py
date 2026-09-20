@@ -52,6 +52,10 @@ class ExpeditionState:
     # Index of the next system we still need to reach (0 = origin / first row).
     next_index: int = 0
     completed: bool = False
+    # Carrier that owns this expedition (None = unbound / legacy).
+    carrier_id: Optional[int] = None
+    # Display snapshot so the UI still shows ownership if the carrier cache is empty.
+    carrier_label: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +63,8 @@ class ExpeditionState:
             "source_name": self.source_name,
             "next_index": self.next_index,
             "completed": self.completed,
+            "carrier_id": self.carrier_id,
+            "carrier_label": self.carrier_label,
             "waypoints": [asdict(wp) for wp in self.waypoints],
         }
 
@@ -67,12 +73,21 @@ class ExpeditionState:
         waypoints = [
             Waypoint(**wp) for wp in data.get("waypoints", []) if isinstance(wp, dict) and wp.get("system")
         ]
+        raw_carrier_id = data.get("carrier_id")
+        carrier_id: Optional[int] = None
+        if raw_carrier_id is not None and str(raw_carrier_id).strip() != "":
+            try:
+                carrier_id = int(raw_carrier_id)
+            except (TypeError, ValueError):
+                carrier_id = None
         return cls(
             active=bool(data.get("active")),
             source_name=str(data.get("source_name") or ""),
             waypoints=waypoints,
             next_index=int(data.get("next_index") or 0),
             completed=bool(data.get("completed")),
+            carrier_id=carrier_id,
+            carrier_label=str(data.get("carrier_label") or ""),
         )
 
 
@@ -351,6 +366,8 @@ class ExpeditionManager:
         self,
         path: str,
         current_system: Optional[str] = None,
+        carrier_id: Optional[int] = None,
+        carrier_label: str = "",
     ) -> ExpeditionState:
         waypoints = parse_spansh_fc_csv(path)
         # Ensure origin is reachable progress even when Done column is absent.
@@ -363,6 +380,8 @@ class ExpeditionManager:
             waypoints=waypoints,
             next_index=1 if len(waypoints) > 1 else 0,
             completed=False,
+            carrier_id=carrier_id,
+            carrier_label=(carrier_label or "").strip(),
         )
         self._apply_progress_from_done_flags()
 
@@ -395,6 +414,29 @@ class ExpeditionManager:
             logger.exception("Failed removing expedition state file")
         self._notify()
 
+    def is_bound_to(self, carrier_id: Optional[int]) -> bool:
+        """True when this expedition is bound to the given carrier."""
+        bound = self.state.carrier_id
+        if bound is None or carrier_id is None:
+            return False
+        return int(bound) == int(carrier_id)
+
+    @property
+    def is_bound(self) -> bool:
+        return self.state.carrier_id is not None
+
+    def assign_carrier(self, carrier_id: Optional[int], carrier_label: str = "") -> bool:
+        """Bind (or re-bind) this expedition to a carrier without re-importing."""
+        if carrier_id is None:
+            return False
+        if not self.state.waypoints:
+            return False
+        self.state.carrier_id = int(carrier_id)
+        self.state.carrier_label = (carrier_label or "").strip()
+        self.save()
+        self._notify()
+        return True
+
     @property
     def is_active(self) -> bool:
         return bool(self.state.active and self.state.waypoints and not self.state.completed)
@@ -417,12 +459,45 @@ class ExpeditionManager:
         return max(0, len(self.state.waypoints) - 1)
 
     def hops_done(self) -> int:
+        """
+        Permanently committed hops (arrival-based).
+
+        After importing, next_index points at the first destination => 0.
+        Arriving at that hop advances next_index => 1, etc.
+        In-flight scheduled jumps are layered on via display_hops_done().
+        """
         if not self.state.waypoints:
             return 0
         if self.state.completed:
             return self.hops_total()
-        # next_index 1 (pointing at first destination) => 0 hops completed.
+        # next_index 1 (still awaiting first arrival) => 0.
         return max(0, min(self.state.next_index - 1, self.hops_total()))
+
+    def display_hops_done(self, pending_destination: Optional[str] = None) -> int:
+        """
+        Passenger-facing hop count: arrived hops, plus one when a jump to the
+        current next waypoint is scheduled (including the final hop -> n/n).
+        """
+        done = self.hops_done()
+        if self.state.completed:
+            return done
+        nxt = self.next_waypoint()
+        if (
+            nxt
+            and pending_destination
+            and _systems_match(nxt.system, pending_destination)
+        ):
+            return min(done + 1, self.hops_total())
+        return done
+
+    def progress_text(self, pending_destination: Optional[str] = None) -> str:
+        """Format hops as 'x / y (z%)', including an in-flight scheduled hop."""
+        total = self.hops_total()
+        done = self.display_hops_done(pending_destination)
+        if total <= 0:
+            return "0 / 0 (0%)"
+        pct = int(round(100.0 * done / total))
+        return f"{done} / {total} ({pct}%)"
 
     def _index_for_system(self, system: Optional[str]) -> Optional[int]:
         if not system:
@@ -475,14 +550,23 @@ class ExpeditionManager:
                 found = True
         return total if found else None
 
-    def status_lines(self, current_system: Optional[str] = None) -> dict[str, str]:
+    def status_lines(
+        self,
+        current_system: Optional[str] = None,
+        pending_destination: Optional[str] = None,
+    ) -> dict[str, str]:
+        carrier = (self.state.carrier_label or "").strip() or (
+            f"ID {self.state.carrier_id}" if self.state.carrier_id is not None else "-"
+        )
+
         if self.state.completed and self.state.waypoints:
             return {
-                "status": "Expedition complete",
+                "status": "Final destination reached",
                 "final": self.final_destination() or "Unknown",
                 "next": "-",
-                "progress": f"{self.hops_total()} / {self.hops_total()}",
+                "progress": self.progress_text(),
                 "remaining": "0 LY",
+                "carrier": carrier,
             }
         if not self.is_active:
             return {
@@ -491,25 +575,43 @@ class ExpeditionManager:
                 "next": "-",
                 "progress": "-",
                 "remaining": "-",
+                "carrier": "-",
             }
 
         nxt = self.next_waypoint()
+        next_text = nxt.system if nxt else "Unknown"
+        if (
+            nxt
+            and pending_destination
+            and _systems_match(nxt.system, pending_destination)
+        ):
+            next_text = str(pending_destination).strip() or next_text
+
         remaining = self.distance_remaining(current_system=current_system)
         remaining_text = f"{remaining:.1f} LY" if remaining is not None else "Unknown"
+        status = "Following route" if self.is_bound else "Unbound — assign a carrier"
         return {
-            "status": "Following route",
+            "status": status,
             "final": self.final_destination() or "Unknown",
-            "next": nxt.system if nxt else "Unknown",
-            "progress": f"{self.hops_done()} / {self.hops_total()}",
+            "next": next_text,
+            "progress": self.progress_text(pending_destination),
             "remaining": remaining_text,
+            "carrier": carrier if self.is_bound else "Unassigned",
         }
 
-    def discord_fields(self, current_system: Optional[str] = None) -> list[dict[str, Any]]:
+    def discord_fields(
+        self,
+        current_system: Optional[str] = None,
+        pending_destination: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
         """Embed fields describing expedition context."""
         if not self.is_active and not (self.state.completed and self.state.waypoints):
             return []
 
-        lines = self.status_lines(current_system=current_system)
+        lines = self.status_lines(
+            current_system=current_system,
+            pending_destination=pending_destination,
+        )
         nxt = self.next_waypoint()
         fields = [
             {"name": "Expedition", "value": lines["status"], "inline": True},
@@ -535,13 +637,12 @@ class ExpeditionManager:
         complete_on_final: bool = True,
     ) -> dict[str, Any]:
         """
-        Mark progress when a schedule/arrival system matches a future waypoint.
+        Mark progress when an arrival system matches a future waypoint.
 
         complete_on_final:
-          True  — arrival (or explicit completion): finishing the last system
-                  completes the expedition.
-          False — jump schedule only: never complete on the final hop; wait
-                  until the carrier actually arrives.
+          True  — arrival: finishing the last system completes the expedition.
+          False — do not complete on the final system (legacy; schedules no
+                  longer permanently advance state).
         """
         result = {
             "matched": False,
@@ -577,8 +678,7 @@ class ExpeditionManager:
 
         final_idx = len(self.state.waypoints) - 1
 
-        # Scheduling (or otherwise noting) the final system must not complete
-        # the expedition until we actually arrive there.
+        # Noting the final system without completing (legacy schedule path).
         if match_idx >= final_idx and not complete_on_final:
             old_next = self.state.next_index
             for idx, waypoint in enumerate(self.state.waypoints):

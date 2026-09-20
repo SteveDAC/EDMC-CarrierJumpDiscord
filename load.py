@@ -76,6 +76,9 @@ CFG_ENABLED = "edmc_cjd_enabled"
 CFG_NOTIFY_REQUEST = "edmc_cjd_notify_request"
 CFG_NOTIFY_CANCEL = "edmc_cjd_notify_cancel"
 CFG_NOTIFY_ARRIVAL = "edmc_cjd_notify_arrival"
+CFG_NOTIFY_EXPEDITION_COMPLETE = "edmc_cjd_notify_expedition_complete"
+CFG_NOTIFY_FLEET = "edmc_cjd_notify_fleet"
+CFG_NOTIFY_SQUADRON = "edmc_cjd_notify_squadron"
 # Legacy single-carrier overrides (treated as fleet carrier overrides).
 CFG_CARRIER_NAME = "edmc_cjd_carrier_name"
 CFG_CARRIER_CALLSIGN = "edmc_cjd_carrier_callsign"
@@ -121,6 +124,9 @@ _enabled_var: Optional[tk.BooleanVar] = None
 _notify_request_var: Optional[tk.BooleanVar] = None
 _notify_cancel_var: Optional[tk.BooleanVar] = None
 _notify_arrival_var: Optional[tk.BooleanVar] = None
+_notify_expedition_complete_var: Optional[tk.BooleanVar] = None
+_notify_fleet_var: Optional[tk.BooleanVar] = None
+_notify_squadron_var: Optional[tk.BooleanVar] = None
 _fleet_name_var: Optional[tk.StringVar] = None
 _fleet_callsign_var: Optional[tk.StringVar] = None
 _squadron_name_var: Optional[tk.StringVar] = None
@@ -131,6 +137,7 @@ _status_label: Optional[tk.Label] = None
 _prefs_status: Optional[tk.Label] = None
 _tracked_label: Optional[tk.Label] = None
 _expedition_status_label: Optional[tk.Label] = None
+_expedition_carrier_label: Optional[tk.Label] = None
 _expedition_final_label: Optional[tk.Label] = None
 _expedition_next_label: Optional[tk.Label] = None
 _expedition_progress_label: Optional[tk.Label] = None
@@ -141,6 +148,7 @@ _expedition_collapsed: bool = False
 _app_frame: Optional[tk.Frame] = None
 
 _current_system: Optional[str] = None
+_current_station: Optional[str] = None
 # carrier_id -> {name, callsign, kind, carrier_type}
 _carriers: dict[int, dict[str, str]] = {}
 # carrier_id -> latest CarrierJumpRequest entry
@@ -328,6 +336,15 @@ def _carrier_record(carrier_id: Optional[int]) -> dict[str, str]:
             "carrier_type": "",
         },
     )
+
+
+def _notify_allowed_for_carrier(carrier_id: Optional[int]) -> bool:
+    """Whether Discord posts are enabled for this carrier's kind."""
+    kind = _carrier_record(carrier_id).get("kind") or KIND_UNKNOWN
+    if kind == KIND_SQUADRON:
+        return _config_bool(CFG_NOTIFY_SQUADRON, True)
+    # Fleet and unknown (not yet classified) use the fleet toggle.
+    return _config_bool(CFG_NOTIFY_FLEET, True)
 
 
 def _carrier_display(carrier_id: Optional[int] = None, kind_hint: Optional[str] = None) -> str:
@@ -651,16 +668,25 @@ def _join_field_groups(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _refresh_expedition_ui() -> None:
     if _expedition is None:
         return
-    lines = _expedition.status_lines(current_system=_current_system)
+    pending = _expedition_pending_destination()
+    lines = _expedition.status_lines(
+        current_system=_current_system,
+        pending_destination=pending,
+    )
     # When collapsed, keep a bit of route context on the header line.
     header_status = lines["status"]
-    if _expedition_collapsed and lines["status"] == "Following route":
+    if _expedition_collapsed and lines["status"] in (
+        "Following route",
+        "Unbound — assign a carrier",
+    ):
         nxt = lines.get("next") or "-"
         progress = lines.get("progress") or "-"
-        header_status = f"Following route — next {nxt} ({progress})"
+        carrier = lines.get("carrier") or "-"
+        header_status = f"{lines['status']} — {carrier} · next {nxt} ({progress})"
 
     mapping = (
         (_expedition_status_label, header_status),
+        (_expedition_carrier_label, lines.get("carrier", "-")),
         (_expedition_final_label, lines["final"]),
         (_expedition_next_label, lines["next"]),
         (_expedition_progress_label, lines["progress"]),
@@ -676,10 +702,29 @@ def _refresh_expedition_ui() -> None:
             pass
 
 
-def _expedition_field_group() -> list[dict[str, Any]]:
+def _expedition_pending_destination() -> Optional[str]:
+    """In-flight jump destination for the carrier bound to the expedition."""
+    if _expedition is None or not _expedition.is_bound:
+        return None
+    carrier_id = _expedition.state.carrier_id
+    if carrier_id is None:
+        return None
+    pending = _pending_jumps.get(carrier_id)
+    if not pending:
+        return None
+    dest = str(pending.get("SystemName") or "").strip()
+    return dest or None
+
+
+def _expedition_field_group(carrier_id: Optional[int] = None) -> list[dict[str, Any]]:
     if _expedition is None:
         return []
-    return _expedition.discord_fields(current_system=_current_system)
+    if not _expedition.is_bound_to(carrier_id):
+        return []
+    return _expedition.discord_fields(
+        current_system=_current_system,
+        pending_destination=_expedition_pending_destination(),
+    )
 
 
 def _build_expedition_complete_payload(cmdr: Optional[str] = None) -> dict[str, Any]:
@@ -687,13 +732,40 @@ def _build_expedition_complete_payload(cmdr: Optional[str] = None) -> dict[str, 
         _expedition.status_lines(current_system=_current_system) if _expedition else {}
     )
     final_dest = lines.get("final") or "Unknown"
-    display = "Expedition"
+    bound_id = _expedition.state.carrier_id if _expedition is not None else None
+    kind = KIND_UNKNOWN
+    if bound_id is not None:
+        kind = _carrier_record(bound_id).get("kind") or KIND_UNKNOWN
+    elif _expedition is not None and "squadron" in str(
+        _expedition.state.carrier_label or ""
+    ).lower():
+        kind = KIND_SQUADRON
+
+    carrier_name = _carrier_display(bound_id, kind) if bound_id is not None else ""
+    if not carrier_name or carrier_name == _kind_label(kind):
+        # Fall back to the label snapshot saved at import/assign.
+        label = (
+            str(_expedition.state.carrier_label or "").strip()
+            if _expedition is not None
+            else ""
+        )
+        if label:
+            # "Fleet Carrier: GALACTICA (V0B-12T)" -> "GALACTICA (V0B-12T)"
+            if ": " in label:
+                carrier_name = label.split(": ", 1)[1].strip() or label
+            else:
+                carrier_name = label
+
     fields = _join_field_groups(
+        _collect_fields(
+            _embed_field("Carrier", carrier_name),
+            _embed_field("Type", _kind_label(kind)),
+            _embed_field(_cmdr_role_field_name(kind), _owner_label(cmdr)),
+        ),
         _collect_fields(
             _embed_field("Final destination", final_dest),
             _embed_field("Progress", lines.get("progress")),
-            _embed_field("Owner", _owner_label(cmdr)),
-        )
+        ),
     )
     mention = _config_str(CFG_MENTION).strip()
     return {
@@ -701,8 +773,11 @@ def _build_expedition_complete_payload(cmdr: Optional[str] = None) -> dict[str, 
         "content": mention or None,
         "embeds": [
             {
-                "title": "Expedition complete",
-                "description": f"Route complete — arrived at **{final_dest}**.\n\u200b",
+                "title": "Final destination reached",
+                "description": (
+                    f"**{carrier_name or 'Carrier'}** completed the route — "
+                    f"arrived at **{final_dest}**.\n\u200b"
+                ),
                 "color": 0x9B59B6,
                 "fields": fields,
                 "footer": {"text": f"{PLUGIN_NAME} v{__version__}"},
@@ -715,13 +790,21 @@ def _handle_expedition_progress(
     system: Optional[str],
     cmdr: Optional[str] = None,
     *,
-    complete_on_final: bool = False,
-) -> None:
-    """Advance expedition when a jump schedule/arrival matches the route."""
+    carrier_id: Optional[int] = None,
+    complete_on_final: bool = True,
+) -> bool:
+    """
+    Advance expedition on arrival when the system matches the route.
+
+    Returns True when an expedition-completion Discord post was queued, so the
+    caller can skip a normal jump-arrival notify for the same event.
+    """
     if _expedition is None or not system:
-        return
+        return False
     if not _expedition.is_active:
-        return
+        return False
+    if not _expedition.is_bound_to(carrier_id):
+        return False
 
     before_completed = bool(_expedition.state.completed)
     result = _expedition.advance_to_system(
@@ -731,19 +814,28 @@ def _handle_expedition_progress(
     if result.get("advanced") or result.get("completed"):
         nxt = _expedition.next_waypoint()
         logger.info(
-            "Expedition advanced via %s (next=%s completed=%s complete_on_final=%s)",
+            "Expedition advanced via %s on carrier %s (next=%s completed=%s complete_on_final=%s)",
             system,
+            carrier_id,
             nxt.system if nxt else None,
             result.get("completed"),
             complete_on_final,
         )
         _set_status(
-            "Expedition complete" if result.get("completed") else f"Route -> {system}",
+            "Final destination reached" if result.get("completed") else f"Route -> {system}",
             "green",
         )
     # Only announce completion when the carrier has actually arrived.
-    if complete_on_final and result.get("completed") and not before_completed:
+    if (
+        complete_on_final
+        and result.get("completed")
+        and not before_completed
+        and _config_bool(CFG_NOTIFY_EXPEDITION_COMPLETE, True)
+        and _notify_allowed_for_carrier(carrier_id)
+    ):
         _enqueue_discord(_build_expedition_complete_payload(cmdr=cmdr))
+        return True
+    return False
 
 
 def _owner_label(cmdr: Optional[str]) -> Optional[str]:
@@ -755,6 +847,13 @@ def _owner_label(cmdr: Optional[str]) -> Optional[str]:
     return f"CMDR {name}"
 
 
+def _cmdr_role_field_name(kind: Optional[str]) -> str:
+    """Squadron carriers may be flown by any authorized captain, not the owner."""
+    if kind == KIND_SQUADRON:
+        return "Captain"
+    return "Owner"
+
+
 def _carrier_fields(
     carrier_id: Optional[int],
     cmdr: Optional[str] = None,
@@ -764,7 +863,7 @@ def _carrier_fields(
     return _collect_fields(
         _embed_field("Carrier", _carrier_display(carrier_id, kind)),
         _embed_field("Type", _kind_label(kind)),
-        _embed_field("Owner", _owner_label(cmdr)),
+        _embed_field(_cmdr_role_field_name(kind), _owner_label(cmdr)),
     )
 
 
@@ -791,7 +890,7 @@ def _build_jump_request_payload(
             _embed_field("Departure", _format_discord_time(departure)),
             _embed_field("Lockdown (approx)", _format_discord_time(lockdown)),
         ),
-        _expedition_field_group(),
+        _expedition_field_group(carrier_id),
     )
 
     mention = _config_str(CFG_MENTION).strip()
@@ -871,7 +970,7 @@ def _build_jump_arrival_payload(
             _embed_field("Arrived in", arrived),
             _embed_field("Body", body),
         ),
-        _expedition_field_group(),
+        _expedition_field_group(carrier_id),
     )
 
     mention = _config_str(CFG_MENTION).strip()
@@ -939,6 +1038,145 @@ def _remember_system(entry: dict[str, Any], system: Optional[str]) -> None:
         _refresh_expedition_ui()
 
 
+def _remember_station(entry: dict[str, Any], station: Optional[str] = None) -> None:
+    """Track the current station/callsign for expedition carrier preselect."""
+    global _current_station
+    station_name = str(entry.get("StationName") or station or "").strip()
+    if station_name:
+        _current_station = station_name
+    elif entry.get("event") in ("Location", "StartUp", "FSDJump") and not entry.get(
+        "StationName"
+    ):
+        # Undocked / in space — clear docked station hint.
+        if not station:
+            _current_station = None
+
+
+def _carrier_label_for_id(carrier_id: Optional[int]) -> str:
+    """Human-readable label for a tracked carrier (kind + display name)."""
+    if carrier_id is None:
+        return "Unknown carrier"
+    info = _carrier_record(carrier_id)
+    kind = info.get("kind") or KIND_UNKNOWN
+    display = _carrier_display(carrier_id, kind)
+    return f"{_kind_label(kind)}: {display}"
+
+
+def _preferred_carrier_id() -> Optional[int]:
+    """Best default carrier for expedition binding."""
+    if not _carriers:
+        return None
+    if len(_carriers) == 1:
+        return next(iter(_carriers))
+
+    if _current_station:
+        docked = _find_carrier_id_by_callsign(_current_station)
+        if docked is not None:
+            return docked
+
+    for carrier_id, info in _carriers.items():
+        if info.get("kind") == KIND_FLEET:
+            return carrier_id
+    return next(iter(_carriers))
+
+
+def _prompt_carrier_choice(
+    title: str = "Select expedition carrier",
+) -> Optional[tuple[int, str]]:
+    """
+    Modal picker listing tracked carriers.
+
+    Returns (carrier_id, label) or None if cancelled / none available.
+    """
+    if not _carriers:
+        try:
+            messagebox.showerror(
+                PLUGIN_NAME,
+                "No carriers learned yet.\n\n"
+                "Open management for each carrier in-game once so names and "
+                "callsigns are tracked, then try again.",
+            )
+        except Exception:
+            pass
+        return None
+
+    parent = None
+    if _app_frame is not None:
+        try:
+            parent = _app_frame.winfo_toplevel()
+        except tk.TclError:
+            parent = None
+
+    dialog = tk.Toplevel(parent) if parent is not None else tk.Toplevel()
+    dialog.title(title)
+    dialog.transient(parent) if parent is not None else None
+    dialog.grab_set()
+    dialog.resizable(False, False)
+
+    result: dict[str, Any] = {"value": None}
+
+    tk.Label(
+        dialog,
+        text="Which carrier is flying this expedition route?",
+        justify=tk.LEFT,
+    ).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(12, 8))
+
+    choices: list[tuple[int, str]] = []
+    for carrier_id in sorted(
+        _carriers.keys(),
+        key=lambda cid: (
+            0 if (_carriers[cid].get("kind") == KIND_FLEET) else 1,
+            _carrier_display(cid).lower(),
+        ),
+    ):
+        choices.append((carrier_id, _carrier_label_for_id(carrier_id)))
+
+    preferred = _preferred_carrier_id()
+
+    listbox = tk.Listbox(dialog, height=min(8, max(3, len(choices))), width=56, exportselection=False)
+    listbox.grid(row=1, column=0, columnspan=2, sticky=tk.EW, padx=12, pady=4)
+    for _cid, label in choices:
+        listbox.insert(tk.END, label)
+
+    # Preselect preferred row.
+    preselect_index = 0
+    for idx, (cid, _label) in enumerate(choices):
+        if preferred is not None and cid == preferred:
+            preselect_index = idx
+            break
+    listbox.selection_set(preselect_index)
+    listbox.activate(preselect_index)
+    listbox.see(preselect_index)
+
+    def _confirm(_event: Optional[Any] = None) -> None:
+        selection = listbox.curselection()
+        if not selection:
+            return
+        idx = int(selection[0])
+        carrier_id, label = choices[idx]
+        result["value"] = (carrier_id, label)
+        dialog.destroy()
+
+    def _cancel(_event: Optional[Any] = None) -> None:
+        result["value"] = None
+        dialog.destroy()
+
+    button_row = tk.Frame(dialog)
+    button_row.grid(row=2, column=0, columnspan=2, sticky=tk.E, padx=12, pady=(8, 12))
+    tk.Button(button_row, text="Cancel", command=_cancel, width=10).grid(
+        row=0, column=0, padx=(0, 6)
+    )
+    tk.Button(button_row, text="OK", command=_confirm, width=10).grid(row=0, column=1)
+
+    listbox.bind("<Double-Button-1>", _confirm)
+    dialog.bind("<Return>", _confirm)
+    dialog.bind("<Escape>", _cancel)
+    dialog.protocol("WM_DELETE_WINDOW", _cancel)
+
+    dialog.wait_window()
+    return result["value"]
+
+
 # ---------------------------------------------------------------------------
 # EDMC plugin hooks
 # ---------------------------------------------------------------------------
@@ -999,14 +1237,26 @@ def _import_expedition_csv() -> None:
     if _expedition is None:
         _set_status("Expedition unavailable", "red")
         return
+
+    choice = _prompt_carrier_choice("Select expedition carrier")
+    if choice is None:
+        return
+    carrier_id, carrier_label = choice
+
     try:
-        state = _expedition.import_csv(path, current_system=_current_system)
+        state = _expedition.import_csv(
+            path,
+            current_system=_current_system,
+            carrier_id=carrier_id,
+            carrier_label=carrier_label,
+        )
         hops = max(0, len(state.waypoints) - 1)
         final_dest = state.waypoints[-1].system if state.waypoints else "Unknown"
         lines = _expedition.status_lines(current_system=_current_system)
         logger.info(
-            "Imported expedition route from %s (%d hops -> %s); status=%s next=%s progress=%s remaining=%s current=%s",
+            "Imported expedition route from %s for %s (%d hops -> %s); status=%s next=%s progress=%s remaining=%s current=%s",
             path,
+            carrier_label,
             hops,
             final_dest,
             lines.get("status"),
@@ -1018,7 +1268,7 @@ def _import_expedition_csv() -> None:
         if state.completed:
             _set_status(f"Expedition already complete -> {final_dest}", "green")
         else:
-            _set_status(f"Following route -> {final_dest}", "green")
+            _set_status(f"Following route on {carrier_label} -> {final_dest}", "green")
         _refresh_expedition_ui()
     except Exception as exc:
         logger.exception("Failed importing expedition CSV")
@@ -1027,6 +1277,32 @@ def _import_expedition_csv() -> None:
             messagebox.showerror(PLUGIN_NAME, f"Could not import route:\n{exc}")
         except Exception:
             pass
+
+
+def _assign_expedition_carrier() -> None:
+    """Bind or re-bind the current expedition to a tracked carrier."""
+    if _expedition is None:
+        return
+    if not _expedition.state.waypoints:
+        try:
+            messagebox.showinfo(
+                PLUGIN_NAME,
+                "No expedition route loaded.\n\nImport a Spansh CSV first.",
+            )
+        except Exception:
+            pass
+        return
+
+    choice = _prompt_carrier_choice("Assign expedition carrier")
+    if choice is None:
+        return
+    carrier_id, carrier_label = choice
+    if _expedition.assign_carrier(carrier_id, carrier_label):
+        logger.info("Expedition assigned to %s (%s)", carrier_label, carrier_id)
+        _set_status(f"Expedition bound to {carrier_label}", "green")
+        _refresh_expedition_ui()
+    else:
+        _set_status("Assign carrier failed", "red")
 
 
 def _clear_expedition_route() -> None:
@@ -1087,7 +1363,7 @@ def _toggle_expedition_collapse() -> None:
 def plugin_app(parent: tk.Frame) -> tk.Frame:
     """Add Discord status and expedition controls to the EDMC main window."""
     global _status_label, _app_frame, _expedition_collapsed
-    global _expedition_status_label, _expedition_final_label
+    global _expedition_status_label, _expedition_carrier_label, _expedition_final_label
     global _expedition_next_label, _expedition_progress_label, _expedition_remaining_label
     global _expedition_detail_frame, _expedition_collapse_btn
 
@@ -1123,29 +1399,36 @@ def plugin_app(parent: tk.Frame) -> tk.Frame:
     _expedition_detail_frame.grid(row=2, column=0, columnspan=2, sticky=tk.EW)
     _expedition_detail_frame.columnconfigure(1, weight=1)
 
-    tk.Label(_expedition_detail_frame, text="Final:").grid(row=0, column=0, sticky=tk.W)
+    tk.Label(_expedition_detail_frame, text="Carrier:").grid(row=0, column=0, sticky=tk.W)
+    _expedition_carrier_label = tk.Label(_expedition_detail_frame, text="-", anchor=tk.W)
+    _expedition_carrier_label.grid(row=0, column=1, sticky=tk.EW)
+
+    tk.Label(_expedition_detail_frame, text="Final:").grid(row=1, column=0, sticky=tk.W)
     _expedition_final_label = tk.Label(_expedition_detail_frame, text="-", anchor=tk.W)
-    _expedition_final_label.grid(row=0, column=1, sticky=tk.EW)
+    _expedition_final_label.grid(row=1, column=1, sticky=tk.EW)
 
-    tk.Label(_expedition_detail_frame, text="Next:").grid(row=1, column=0, sticky=tk.W)
+    tk.Label(_expedition_detail_frame, text="Next:").grid(row=2, column=0, sticky=tk.W)
     _expedition_next_label = tk.Label(_expedition_detail_frame, text="-", anchor=tk.W)
-    _expedition_next_label.grid(row=1, column=1, sticky=tk.EW)
+    _expedition_next_label.grid(row=2, column=1, sticky=tk.EW)
 
-    tk.Label(_expedition_detail_frame, text="Progress:").grid(row=2, column=0, sticky=tk.W)
+    tk.Label(_expedition_detail_frame, text="Progress:").grid(row=3, column=0, sticky=tk.W)
     _expedition_progress_label = tk.Label(_expedition_detail_frame, text="-", anchor=tk.W)
-    _expedition_progress_label.grid(row=2, column=1, sticky=tk.EW)
+    _expedition_progress_label.grid(row=3, column=1, sticky=tk.EW)
 
-    tk.Label(_expedition_detail_frame, text="Remaining:").grid(row=3, column=0, sticky=tk.W)
+    tk.Label(_expedition_detail_frame, text="Remaining:").grid(row=4, column=0, sticky=tk.W)
     _expedition_remaining_label = tk.Label(_expedition_detail_frame, text="-", anchor=tk.W)
-    _expedition_remaining_label.grid(row=3, column=1, sticky=tk.EW)
+    _expedition_remaining_label.grid(row=4, column=1, sticky=tk.EW)
 
     buttons = tk.Frame(_expedition_detail_frame)
-    buttons.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+    buttons.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
     tk.Button(buttons, text="Import route CSV", command=_import_expedition_csv).grid(
         row=0, column=0, padx=(0, 6)
     )
+    tk.Button(buttons, text="Assign carrier", command=_assign_expedition_carrier).grid(
+        row=0, column=1, padx=(0, 6)
+    )
     tk.Button(buttons, text="Clear route", command=_clear_expedition_route).grid(
-        row=0, column=1
+        row=0, column=2
     )
 
     _refresh_expedition_ui()
@@ -1157,7 +1440,9 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
     """Settings tab for Discord delivery and notification options."""
     global _webhook_var, _delivery_mode_var, _bot_token_var, _channel_id_var
     global _enabled_var, _notify_request_var, _notify_cancel_var
-    global _notify_arrival_var, _fleet_name_var, _fleet_callsign_var
+    global _notify_arrival_var, _notify_expedition_complete_var
+    global _notify_fleet_var, _notify_squadron_var
+    global _fleet_name_var, _fleet_callsign_var
     global _squadron_name_var, _squadron_callsign_var, _mention_var
     global _prefs_status, _tracked_label
 
@@ -1169,6 +1454,11 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
     _notify_request_var = tk.BooleanVar(value=_config_bool(CFG_NOTIFY_REQUEST, True))
     _notify_cancel_var = tk.BooleanVar(value=_config_bool(CFG_NOTIFY_CANCEL, True))
     _notify_arrival_var = tk.BooleanVar(value=_config_bool(CFG_NOTIFY_ARRIVAL, False))
+    _notify_expedition_complete_var = tk.BooleanVar(
+        value=_config_bool(CFG_NOTIFY_EXPEDITION_COMPLETE, True)
+    )
+    _notify_fleet_var = tk.BooleanVar(value=_config_bool(CFG_NOTIFY_FLEET, True))
+    _notify_squadron_var = tk.BooleanVar(value=_config_bool(CFG_NOTIFY_SQUADRON, True))
     _fleet_name_var = tk.StringVar(value=_config_str(CFG_CARRIER_NAME))
     _fleet_callsign_var = tk.StringVar(value=_config_str(CFG_CARRIER_CALLSIGN))
     _squadron_name_var = tk.StringVar(value=_config_str(CFG_SQUADRON_NAME))
@@ -1209,6 +1499,27 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
         frame,
         text="Notify on jump arrival (when docked on your carrier)",
         variable=_notify_arrival_var,
+    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
+
+    row += 1
+    nb.Checkbutton(
+        frame,
+        text="Notify on expedition completion",
+        variable=_notify_expedition_complete_var,
+    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
+
+    row += 1
+    nb.Checkbutton(
+        frame,
+        text="Notify for Fleet Carrier",
+        variable=_notify_fleet_var,
+    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
+
+    row += 1
+    nb.Checkbutton(
+        frame,
+        text="Notify for Squadron Carrier",
+        variable=_notify_squadron_var,
     ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
 
     row += 1
@@ -1368,6 +1679,15 @@ def _persist_prefs_from_vars() -> None:
         config.set(CFG_NOTIFY_CANCEL, bool(_notify_cancel_var.get()))
     if _notify_arrival_var is not None:
         config.set(CFG_NOTIFY_ARRIVAL, bool(_notify_arrival_var.get()))
+    if _notify_expedition_complete_var is not None:
+        config.set(
+            CFG_NOTIFY_EXPEDITION_COMPLETE,
+            bool(_notify_expedition_complete_var.get()),
+        )
+    if _notify_fleet_var is not None:
+        config.set(CFG_NOTIFY_FLEET, bool(_notify_fleet_var.get()))
+    if _notify_squadron_var is not None:
+        config.set(CFG_NOTIFY_SQUADRON, bool(_notify_squadron_var.get()))
     if _fleet_name_var is not None:
         config.set(CFG_CARRIER_NAME, _fleet_name_var.get().strip())
     if _fleet_callsign_var is not None:
@@ -1430,6 +1750,29 @@ def _send_test_message() -> None:
         carrier_id=test_id,
         cmdr="Test CMDR",
     )
+    # Keep test embeds plain even when an expedition is bound to this carrier.
+    if payload.get("embeds"):
+        expedition_names = {
+            "Expedition",
+            "Final destination",
+            "Progress",
+            "Next waypoint",
+            "Distance left",
+            "Restock",
+        }
+        cleaned: list[dict[str, Any]] = []
+        for field in payload["embeds"][0].get("fields") or []:
+            if field.get("name") in expedition_names:
+                continue
+            if field.get("name") == "\u200b" and field.get("value") == "\u200b":
+                if cleaned and cleaned[-1].get("name") != "\u200b":
+                    cleaned.append(field)
+                continue
+            cleaned.append(field)
+        while cleaned and cleaned[-1].get("name") == "\u200b":
+            cleaned.pop()
+        payload["embeds"][0]["fields"] = cleaned
+
     if temporary:
         _carriers.pop(test_id, None)
     mode = _delivery_mode()
@@ -1461,8 +1804,9 @@ def journal_entry(
     if not event:
         return None
 
-    if event in ("Location", "FSDJump", "CarrierJump", "StartUp"):
+    if event in ("Location", "FSDJump", "CarrierJump", "StartUp", "Docked", "Undocked"):
         _remember_system(entry, system)
+        _remember_station(entry, station)
 
     if event in ("CarrierStats", "CarrierNameChanged", "CarrierBuy", "CarrierLocation"):
         carrier_id = _update_carrier_from_entry(entry)
@@ -1495,23 +1839,26 @@ def journal_entry(
             departure or entry.get("DepartureTime"),
         )
         _set_status(f"Jump to {destination}", "cyan")
+        _refresh_expedition_ui()
 
         if _config_bool(CFG_NOTIFY_REQUEST, True):
-            if _is_duplicate_notification(_last_notified_request, carrier_id, departure):
+            if not _notify_allowed_for_carrier(carrier_id):
+                logger.info(
+                    "Skipping CarrierJumpRequest notify for %s (carrier kind disabled)",
+                    carrier_id,
+                )
+            elif _is_duplicate_notification(_last_notified_request, carrier_id, departure):
                 logger.info(
                     "Skipping duplicate CarrierJumpRequest notify for %s at %s",
                     carrier_id,
                     departure,
                 )
             else:
-                # Enrich Discord first (next waypoint = this destination), then advance.
                 payload = _build_jump_request_payload(
                     entry, from_system, carrier_id, cmdr=cmdr
                 )
                 _enqueue_discord(payload)
 
-        # Scheduling the final hop must not mark the expedition complete.
-        _handle_expedition_progress(destination, cmdr=cmdr, complete_on_final=False)
         return None
 
     if event == "CarrierJumpCancelled":
@@ -1533,7 +1880,12 @@ def journal_entry(
         _set_status("Jump cancelled", "orange")
 
         if _config_bool(CFG_NOTIFY_CANCEL, True):
-            if _is_duplicate_notification(_last_notified_cancel, carrier_id, cancel_token):
+            if not _notify_allowed_for_carrier(carrier_id):
+                logger.info(
+                    "Skipping CarrierJumpCancelled notify for %s (carrier kind disabled)",
+                    carrier_id,
+                )
+            elif _is_duplicate_notification(_last_notified_cancel, carrier_id, cancel_token):
                 logger.info(
                     "Skipping duplicate CarrierJumpCancelled notify for %s",
                     carrier_id,
@@ -1545,6 +1897,7 @@ def journal_entry(
         if carrier_id is not None:
             _pending_jumps.pop(carrier_id, None)
             _last_notified_request.pop(carrier_id, None)
+        _refresh_expedition_ui()
         return None
 
     if event == "CarrierJump":
@@ -1570,13 +1923,32 @@ def journal_entry(
         logger.info("CarrierJump arrival [%s] in %s", carrier_id, arrived)
         _set_status(f"Arrived: {arrived}", "green")
 
-        # Advance before arrival Discord so progress reflects this arrival.
-        # Completion is only allowed on actual arrival at the final system.
-        _handle_expedition_progress(arrived, cmdr=cmdr, complete_on_final=True)
+        # Advance on arrival only; clear pending before Discord so Progress/Next
+        # reflect post-arrival state (not the hop that just finished).
+        completion_posted = _handle_expedition_progress(
+            arrived,
+            cmdr=cmdr,
+            carrier_id=carrier_id,
+            complete_on_final=True,
+        )
+        if carrier_id is not None:
+            _pending_jumps.pop(carrier_id, None)
+            _last_notified_request.pop(carrier_id, None)
+        _refresh_expedition_ui()
 
         arrival_token = f"{arrived}|{entry.get('timestamp') or ''}"
         if _config_bool(CFG_NOTIFY_ARRIVAL, False):
-            if _is_duplicate_notification(_last_notified_arrival, carrier_id, arrival_token):
+            if completion_posted:
+                logger.info(
+                    "Skipping jump-arrival notify for %s; expedition completion posted instead",
+                    carrier_id,
+                )
+            elif not _notify_allowed_for_carrier(carrier_id):
+                logger.info(
+                    "Skipping CarrierJump arrival notify for %s (carrier kind disabled)",
+                    carrier_id,
+                )
+            elif _is_duplicate_notification(_last_notified_arrival, carrier_id, arrival_token):
                 logger.info(
                     "Skipping duplicate CarrierJump arrival notify for %s in %s",
                     carrier_id,
@@ -1586,9 +1958,6 @@ def journal_entry(
                 payload = _build_jump_arrival_payload(entry, carrier_id, cmdr=cmdr)
                 _enqueue_discord(payload)
 
-        if carrier_id is not None:
-            _pending_jumps.pop(carrier_id, None)
-            _last_notified_request.pop(carrier_id, None)
         return None
 
     return None
