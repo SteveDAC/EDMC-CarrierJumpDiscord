@@ -16,6 +16,7 @@ Elite Dangerous Market Connector (EDMC) plugin that posts to a Discord channel w
 - Supports **webhook** or **bot token + channel ID** delivery
 - Sends Discord HTTP requests on a background thread so EDMC stays responsive
 - Settings tab with delivery options, toggles, dual carrier overrides, and a **Send test message** button
+- Optional **expedition mode**: import a Spansh Fleet Carrier route CSV, bind it to one carrier, and include route progress on that carrier’s Discord jump posts
 
 ## Requirements
 
@@ -89,7 +90,8 @@ On Windows, clone into `%LOCALAPPDATA%\EDMarketConnector\plugins\EDMC-CarrierJum
 ### Shared options
 
 - Enable / disable notifications
-- Notify on schedule, cancel, and/or arrival
+- Notify on schedule, cancel, arrival, and/or expedition completion
+- Notify for Fleet Carrier and/or Squadron Carrier (source filter; both on by default)
 - Optional mention such as `@here`, `<@&role_id>`, or `<@user_id>`
 - Separate Fleet Carrier and Squadron Carrier name / callsign overrides
 
@@ -101,21 +103,34 @@ When you schedule a carrier jump, Elite writes a `CarrierJumpRequest` journal ev
 
 Approximate lockdown time is calculated as **departure − 3 minutes 20 seconds** (standard pad lockdown window). Treat it as a guide; Frontier timing can vary with jump queues.
 
+## Expedition mode
+
+Import a Spansh Fleet Carrier (or Spansh Tools) route CSV from the EDMC main window. At import you choose which **tracked carrier** owns the route.
+
+- Only that carrier’s jump schedule/arrival posts include expedition fields (final destination, next waypoint, progress, distance left).
+- Other carriers still post normal jump notifications and **do not** advance the expedition, even if they jump to a system on the route.
+- Use **Assign carrier** to bind a legacy/unbound route or to correct the wrong pick without re-importing.
+- Open carrier management in-game once per carrier before importing so they appear in the picker.
+- **Progress** counts the hop underway when a jump is scheduled (first plot → `1/n`, final plot → `n/n`). Cancelling rewinds that display; only arrival permanently locks the hop and moves Next forward.
+
 ## Development layout
 
 ```
 EDMC-CarrierJumpDiscord/
-  load.py      # EDMC plugin entry point
+  load.py         # EDMC plugin entry point
+  expedition.py   # Spansh route import and progress tracking
   README.md
 ```
 
-Plugin version is `__version__` in `load.py` (`1.4.1`).
+Plugin version is `__version__` in `load.py` (`1.5.0-dev`).
 
 Repeat `CarrierJumpRequest` journal events for the same carrier and departure time are ignored so Discord is not spammed when the game re-emits a pending jump.
 
 Times in Discord posts use Discord's `<t:unix:f>` / `<t:unix:R>` markup, so each viewer sees local date/time plus a relative countdown (for example "in 15 minutes").
 
 Arrival notifications are off by default. Enable **Notify on jump arrival** in settings. Arrival posts only when the journal `CarrierJump` event matches a tracked carrier (by Carrier ID, callsign, or a pending jump to that system), so hitchhiking on an unrelated carrier should not notify.
+
+**Notify on expedition completion** is on by default. When the bound carrier arrives at the final waypoint, Discord gets a separate “Final destination reached” post. That is independent of jump-arrival notifies — you can enable either, both, or neither. If both are enabled and the arrival finishes the expedition, only the expedition completion post is sent (the normal jump-arrival embed is skipped).
 
 Pending jumps are tracked per carrier ID, so a fleet carrier jump and a squadron carrier jump can be outstanding at the same time without overwriting each other.
 
