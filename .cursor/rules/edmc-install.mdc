@@ -1,0 +1,20 @@
+---
+description: After code changes, install this plugin into the local EDMC plugins folder for testing
+alwaysApply: true
+---
+
+# Install into EDMC after changes
+
+This repo is the source of truth for development. EDMC loads the plugin from:
+
+`%LOCALAPPDATA%\EDMarketConnector\plugins\EDMC-CarrierJumpDiscord`
+
+(On non-Windows, use the equivalent EDMC plugins directory for your platform.)
+
+Whenever you change plugin code or docs the user will test in EDMC (`load.py`, `expedition.py`, `README.md`, or other runtime files):
+
+1. Copy those updated files from the repo into the EDMC plugins folder above.
+2. Do **not** overwrite live runtime state such as `expedition_state.json`.
+3. Tell the user they need to **restart EDMC** to pick up the changes.
+
+Prefer a simple file copy (e.g. PowerShell `Copy-Item`) over inventing an installer unless the user asks for one.
