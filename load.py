@@ -48,7 +48,7 @@ def plugin_name_guess() -> str:
 # ---------------------------------------------------------------------------
 
 PLUGIN_NAME = "Carrier Jump Discord"
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 plugin_name = os.path.basename(os.path.dirname(__file__))
 logger = logging.getLogger(f"{appname}.{plugin_name}")
@@ -144,11 +144,13 @@ _expedition_progress_label: Optional[tk.Label] = None
 _expedition_remaining_label: Optional[tk.Label] = None
 _expedition_detail_frame: Optional[tk.Frame] = None
 _expedition_collapse_btn: Optional[tk.Button] = None
+_expedition_announce_btn: Optional[tk.Button] = None
 _expedition_collapsed: bool = False
 _app_frame: Optional[tk.Frame] = None
 
 _current_system: Optional[str] = None
 _current_station: Optional[str] = None
+_last_cmdr: Optional[str] = None
 # carrier_id -> {name, callsign, kind, carrier_type}
 _carriers: dict[int, dict[str, str]] = {}
 # carrier_id -> latest CarrierJumpRequest entry
@@ -701,6 +703,31 @@ def _refresh_expedition_ui() -> None:
         except tk.TclError:
             pass
 
+    if _expedition_announce_btn is not None:
+        try:
+            if _expedition_announce_btn.winfo_exists():
+                enabled = _can_announce_pre_departure()
+                _expedition_announce_btn.configure(
+                    state=tk.NORMAL if enabled else tk.DISABLED
+                )
+        except tk.TclError:
+            pass
+
+
+def _can_announce_pre_departure() -> bool:
+    """Whether the Announce departure button should be enabled."""
+    if _expedition is None:
+        return False
+    if not _expedition.state.waypoints:
+        return False
+    if not _expedition.is_active:
+        return False
+    if _expedition.state.completed:
+        return False
+    if _expedition.state.pre_announced and not _allow_repeat_pre_announce():
+        return False
+    return True
+
 
 def _expedition_pending_destination() -> Optional[str]:
     """In-flight jump destination for the carrier bound to the expedition."""
@@ -741,20 +768,7 @@ def _build_expedition_complete_payload(cmdr: Optional[str] = None) -> dict[str, 
     ).lower():
         kind = KIND_SQUADRON
 
-    carrier_name = _carrier_display(bound_id, kind) if bound_id is not None else ""
-    if not carrier_name or carrier_name == _kind_label(kind):
-        # Fall back to the label snapshot saved at import/assign.
-        label = (
-            str(_expedition.state.carrier_label or "").strip()
-            if _expedition is not None
-            else ""
-        )
-        if label:
-            # "Fleet Carrier: GALACTICA (V0B-12T)" -> "GALACTICA (V0B-12T)"
-            if ": " in label:
-                carrier_name = label.split(": ", 1)[1].strip() or label
-            else:
-                carrier_name = label
+    carrier_name = _expedition_carrier_name()
 
     fields = _join_field_groups(
         _collect_fields(
@@ -780,6 +794,56 @@ def _build_expedition_complete_payload(cmdr: Optional[str] = None) -> dict[str, 
                 ),
                 "color": 0x9B59B6,
                 "fields": fields,
+                "footer": {"text": f"{PLUGIN_NAME} v{__version__}"},
+            }
+        ],
+    }
+
+
+def _build_expedition_pre_departure_payload(
+    departure: datetime,
+    cmdr: Optional[str] = None,
+) -> dict[str, Any]:
+    """Narrative embed announcing an upcoming expedition departure."""
+    carrier_name = _expedition_carrier_name()
+    origin = (_current_system or "").strip()
+    if not origin and _expedition is not None and _expedition.state.waypoints:
+        origin = str(_expedition.state.waypoints[0].system or "").strip()
+    if not origin:
+        origin = "Unknown"
+
+    final_dest = "Unknown"
+    distance_text = "Unknown"
+    hops = 0
+    if _expedition is not None:
+        final_dest = _expedition.final_destination() or "Unknown"
+        hops = _expedition.hops_total()
+        remaining = _expedition.distance_remaining(current_system=_current_system)
+        if remaining is not None:
+            distance_text = f"{remaining:.1f} LY"
+
+    time_text = _format_discord_time(departure) or "soon"
+    owner = _owner_label(cmdr) or "CMDR"
+
+    description = (
+        f"**{carrier_name}** will be departing from **{origin}** at {time_text} "
+        f"and heading to **{final_dest}**. This will cover **{distance_text}** "
+        f"and take **{hops}** jumps.\n\n"
+        f"- {owner}\n\n"
+        f"If you would like to join, please make your way to **{origin}** "
+        f"before departure.\n\n"
+        f"*(Departure time is approximate and potentially subject to change.)*"
+    )
+
+    mention = _config_str(CFG_MENTION).strip()
+    return {
+        "username": "EDMC Carrier Jump",
+        "content": mention or None,
+        "embeds": [
+            {
+                "title": "Carrier departing soon",
+                "description": description,
+                "color": 0x1ABC9C,
                 "footer": {"text": f"{PLUGIN_NAME} v{__version__}"},
             }
         ],
@@ -845,6 +909,42 @@ def _owner_label(cmdr: Optional[str]) -> Optional[str]:
     if name.upper().startswith("CMDR "):
         return name
     return f"CMDR {name}"
+
+
+def _remember_cmdr(cmdr: Optional[str]) -> None:
+    """Cache the last-seen commander name for UI-driven Discord posts."""
+    global _last_cmdr
+    name = (cmdr or "").strip()
+    if name:
+        _last_cmdr = name
+
+
+def _allow_repeat_pre_announce() -> bool:
+    """Dev builds may re-send pre-departure announces for testing."""
+    return "-dev" in __version__
+
+
+def _expedition_carrier_name() -> str:
+    """Display name for the carrier bound to the current expedition."""
+    if _expedition is None:
+        return "Carrier"
+    bound_id = _expedition.state.carrier_id
+    kind = KIND_UNKNOWN
+    if bound_id is not None:
+        kind = _carrier_record(bound_id).get("kind") or KIND_UNKNOWN
+    elif "squadron" in str(_expedition.state.carrier_label or "").lower():
+        kind = KIND_SQUADRON
+
+    carrier_name = _carrier_display(bound_id, kind) if bound_id is not None else ""
+    if not carrier_name or carrier_name == _kind_label(kind):
+        label = str(_expedition.state.carrier_label or "").strip()
+        if label:
+            # "Fleet Carrier: GALACTICA (V0B-12T)" -> "GALACTICA (V0B-12T)"
+            if ": " in label:
+                carrier_name = label.split(": ", 1)[1].strip() or label
+            else:
+                carrier_name = label
+    return carrier_name or "Carrier"
 
 
 def _cmdr_role_field_name(kind: Optional[str]) -> str:
@@ -1313,6 +1413,172 @@ def _clear_expedition_route() -> None:
     _refresh_expedition_ui()
 
 
+def _prompt_pre_departure_delay() -> Optional[timedelta]:
+    """Ask how long until the first jump; returns None if cancelled."""
+    parent = None
+    if _app_frame is not None:
+        try:
+            parent = _app_frame.winfo_toplevel()
+        except tk.TclError:
+            parent = None
+
+    dialog = tk.Toplevel(parent) if parent is not None else tk.Toplevel()
+    dialog.title("Announce departure")
+    if parent is not None:
+        dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+
+    result: dict[str, Any] = {"value": None}
+
+    tk.Label(
+        dialog,
+        text="How long until you initiate the first jump?",
+        justify=tk.LEFT,
+    ).grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(12, 8))
+
+    tk.Label(dialog, text="Hours:").grid(row=1, column=0, sticky=tk.W, padx=(12, 4))
+    hours_var = tk.StringVar(value="0")
+    hours_spin = tk.Spinbox(
+        dialog,
+        from_=0,
+        to=168,
+        width=5,
+        textvariable=hours_var,
+    )
+    hours_spin.grid(row=1, column=1, sticky=tk.W, padx=(0, 12))
+
+    tk.Label(dialog, text="Minutes:").grid(row=1, column=2, sticky=tk.W, padx=(0, 4))
+    minutes_var = tk.StringVar(value="30")
+    minutes_spin = tk.Spinbox(
+        dialog,
+        from_=0,
+        to=59,
+        width=5,
+        textvariable=minutes_var,
+    )
+    minutes_spin.grid(row=1, column=3, sticky=tk.W, padx=(0, 12))
+
+    warning = (
+        "This action can only be performed once for this expedition."
+        if not _allow_repeat_pre_announce()
+        else "Dev build: you can send this announce more than once while testing."
+    )
+    tk.Label(
+        dialog,
+        text=warning,
+        justify=tk.LEFT,
+        wraplength=360,
+        fg="#b35c00",
+    ).grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(8, 4))
+
+    def _parse_nonneg_int(raw: str) -> Optional[int]:
+        text = (raw or "").strip()
+        if not text:
+            return 0
+        try:
+            value = int(text)
+        except ValueError:
+            return None
+        if value < 0:
+            return None
+        return value
+
+    def _confirm(_event: Optional[Any] = None) -> None:
+        hours = _parse_nonneg_int(hours_var.get())
+        minutes = _parse_nonneg_int(minutes_var.get())
+        if hours is None or minutes is None:
+            try:
+                messagebox.showerror(
+                    PLUGIN_NAME,
+                    "Enter whole numbers for hours and minutes.",
+                    parent=dialog,
+                )
+            except Exception:
+                pass
+            return
+        if hours == 0 and minutes == 0:
+            try:
+                messagebox.showerror(
+                    PLUGIN_NAME,
+                    "Enter a delay greater than zero.",
+                    parent=dialog,
+                )
+            except Exception:
+                pass
+            return
+        result["value"] = timedelta(hours=hours, minutes=minutes)
+        dialog.destroy()
+
+    def _cancel(_event: Optional[Any] = None) -> None:
+        result["value"] = None
+        dialog.destroy()
+
+    button_row = tk.Frame(dialog)
+    button_row.grid(row=3, column=0, columnspan=4, sticky=tk.E, padx=12, pady=(8, 12))
+    tk.Button(button_row, text="Cancel", command=_cancel, width=10).grid(
+        row=0, column=0, padx=(0, 6)
+    )
+    tk.Button(button_row, text="Announce", command=_confirm, width=10).grid(
+        row=0, column=1
+    )
+
+    dialog.bind("<Return>", _confirm)
+    dialog.bind("<Escape>", _cancel)
+    dialog.protocol("WM_DELETE_WINDOW", _cancel)
+
+    dialog.wait_window()
+    return result["value"]
+
+
+def _announce_expedition_departure() -> None:
+    """Post a one-shot pre-departure announce for the imported expedition."""
+    if _expedition is None or not _can_announce_pre_departure():
+        return
+
+    if not _config_bool(CFG_ENABLED, True):
+        _set_status("Disabled", "orange")
+        try:
+            messagebox.showinfo(PLUGIN_NAME, "Discord posting is disabled in settings.")
+        except Exception:
+            pass
+        return
+
+    ok, message = _delivery_configured()
+    if not ok:
+        _set_status(message, "orange")
+        try:
+            messagebox.showerror(PLUGIN_NAME, f"Discord delivery not ready:\n{message}")
+        except Exception:
+            pass
+        return
+
+    delay = _prompt_pre_departure_delay()
+    if delay is None:
+        return
+
+    departure = datetime.now(timezone.utc) + delay
+    payload = _build_expedition_pre_departure_payload(
+        departure,
+        cmdr=_last_cmdr,
+    )
+    ok, message = _post_discord(payload)
+    if not ok:
+        logger.error("Pre-departure announce failed: %s", message)
+        _set_status("Pre-departure announce failed", "red")
+        try:
+            messagebox.showerror(PLUGIN_NAME, f"Could not post to Discord:\n{message}")
+        except Exception:
+            pass
+        return
+
+    logger.info("Pre-departure announce posted (%s)", message)
+    if not _allow_repeat_pre_announce():
+        _expedition.mark_pre_announced()
+    _set_status("Pre-departure announced", "green")
+    _refresh_expedition_ui()
+
+
 def _apply_expedition_collapse() -> None:
     """Show or hide expedition detail rows and update the toggle button."""
     global _expedition_collapse_btn, _expedition_detail_frame
@@ -1365,7 +1631,7 @@ def plugin_app(parent: tk.Frame) -> tk.Frame:
     global _status_label, _app_frame, _expedition_collapsed
     global _expedition_status_label, _expedition_carrier_label, _expedition_final_label
     global _expedition_next_label, _expedition_progress_label, _expedition_remaining_label
-    global _expedition_detail_frame, _expedition_collapse_btn
+    global _expedition_detail_frame, _expedition_collapse_btn, _expedition_announce_btn
 
     _expedition_collapsed = _config_bool(CFG_EXPEDITION_COLLAPSED, False)
 
@@ -1428,8 +1694,15 @@ def plugin_app(parent: tk.Frame) -> tk.Frame:
         row=0, column=1, padx=(0, 6)
     )
     tk.Button(buttons, text="Clear route", command=_clear_expedition_route).grid(
-        row=0, column=2
+        row=0, column=2, padx=(0, 6)
     )
+    _expedition_announce_btn = tk.Button(
+        buttons,
+        text="Announce departure",
+        command=_announce_expedition_departure,
+        state=tk.DISABLED,
+    )
+    _expedition_announce_btn.grid(row=0, column=3)
 
     _refresh_expedition_ui()
     _apply_expedition_collapse()
@@ -1438,6 +1711,7 @@ def plugin_app(parent: tk.Frame) -> tk.Frame:
 
 def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
     """Settings tab for Discord delivery and notification options."""
+    _remember_cmdr(cmdr)
     global _webhook_var, _delivery_mode_var, _bot_token_var, _channel_id_var
     global _enabled_var, _notify_request_var, _notify_cancel_var
     global _notify_arrival_var, _notify_expedition_complete_var
@@ -1702,6 +1976,7 @@ def _persist_prefs_from_vars() -> None:
 
 def prefs_changed(cmdr: str, is_beta: bool) -> None:
     """Persist settings when the preferences dialog is closed."""
+    _remember_cmdr(cmdr)
     _persist_prefs_from_vars()
     _refresh_tracked_label()
     _refresh_ready_status()
@@ -1800,6 +2075,7 @@ def journal_entry(
     state: dict[str, Any],
 ) -> Optional[str]:
     """Handle Elite Dangerous journal events."""
+    _remember_cmdr(cmdr)
     event = entry.get("event")
     if not event:
         return None

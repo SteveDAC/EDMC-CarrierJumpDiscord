@@ -112,6 +112,7 @@ Import a Spansh Fleet Carrier (or Spansh Tools) route CSV from the EDMC main win
 - Use **Assign carrier** to bind a legacy/unbound route or to correct the wrong pick without re-importing.
 - Open carrier management in-game once per carrier before importing so they appear in the picker.
 - **Progress** counts the hop underway when a jump is scheduled (first plot → `1/n`, final plot → `n/n`). Cancelling rewinds that display; only arrival permanently locks the hop and moves Next forward.
+- **Announce departure** posts a one-shot pre-departure Discord embed (delay until first jump, final destination, distance, hop count). After a successful post it stays locked for that expedition until you import or clear a route.
 
 ## Development layout
 
@@ -122,7 +123,7 @@ EDMC-CarrierJumpDiscord/
   README.md
 ```
 
-Plugin version is `__version__` in `load.py` (`1.5.0`).
+Plugin version is `__version__` in `load.py` (`1.6.0`).
 
 Repeat `CarrierJumpRequest` journal events for the same carrier and departure time are ignored so Discord is not spammed when the game re-emits a pending jump.
 

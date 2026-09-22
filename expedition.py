@@ -56,6 +56,8 @@ class ExpeditionState:
     carrier_id: Optional[int] = None
     # Display snapshot so the UI still shows ownership if the carrier cache is empty.
     carrier_label: str = ""
+    # True after a successful pre-departure Discord announce for this route.
+    pre_announced: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +67,7 @@ class ExpeditionState:
             "completed": self.completed,
             "carrier_id": self.carrier_id,
             "carrier_label": self.carrier_label,
+            "pre_announced": self.pre_announced,
             "waypoints": [asdict(wp) for wp in self.waypoints],
         }
 
@@ -88,6 +91,7 @@ class ExpeditionState:
             completed=bool(data.get("completed")),
             carrier_id=carrier_id,
             carrier_label=str(data.get("carrier_label") or ""),
+            pre_announced=bool(data.get("pre_announced")),
         )
 
 
@@ -382,6 +386,7 @@ class ExpeditionManager:
             completed=False,
             carrier_id=carrier_id,
             carrier_label=(carrier_label or "").strip(),
+            pre_announced=False,
         )
         self._apply_progress_from_done_flags()
 
@@ -424,6 +429,15 @@ class ExpeditionManager:
     @property
     def is_bound(self) -> bool:
         return self.state.carrier_id is not None
+
+    def mark_pre_announced(self) -> bool:
+        """Record that a pre-departure announce was sent for this expedition."""
+        if not self.state.waypoints or self.state.completed:
+            return False
+        self.state.pre_announced = True
+        self.save()
+        self._notify()
+        return True
 
     def assign_carrier(self, carrier_id: Optional[int], carrier_label: str = "") -> bool:
         """Bind (or re-bind) this expedition to a carrier without re-importing."""
