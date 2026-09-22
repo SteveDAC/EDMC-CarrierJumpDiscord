@@ -48,7 +48,7 @@ def plugin_name_guess() -> str:
 # ---------------------------------------------------------------------------
 
 PLUGIN_NAME = "Carrier Jump Discord"
-__version__ = "1.6.0-dev"
+__version__ = "1.6.0"
 
 plugin_name = os.path.basename(os.path.dirname(__file__))
 logger = logging.getLogger(f"{appname}.{plugin_name}")
@@ -829,9 +829,10 @@ def _build_expedition_pre_departure_payload(
         f"**{carrier_name}** will be departing from **{origin}** at {time_text} "
         f"and heading to **{final_dest}**. This will cover **{distance_text}** "
         f"and take **{hops}** jumps.\n\n"
-        f"— {owner}\n\n"
+        f"- {owner}\n\n"
         f"If you would like to join, please make your way to **{origin}** "
-        f"before departure."
+        f"before departure.\n\n"
+        f"*(Departure time is approximate and potentially subject to change.)*"
     )
 
     mention = _config_str(CFG_MENTION).strip()

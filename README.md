@@ -123,7 +123,7 @@ EDMC-CarrierJumpDiscord/
   README.md
 ```
 
-Plugin version is `__version__` in `load.py` (`1.6.0-dev`).
+Plugin version is `__version__` in `load.py` (`1.6.0`).
 
 Repeat `CarrierJumpRequest` journal events for the same carrier and departure time are ignored so Discord is not spammed when the game re-emits a pending jump.
 
