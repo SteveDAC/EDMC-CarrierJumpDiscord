@@ -10,6 +10,7 @@ Elite Dangerous Market Connector (EDMC) plugin that posts to a Discord channel w
   - `CarrierJump` — arrival (optional; only when docked on a *tracked* carrier)
 - Tracks **personal fleet carriers and squadron carriers separately** by Carrier ID
 - Learns name / callsign / type from `CarrierStats`, `CarrierNameChanged`, `CarrierBuy`, and `CarrierLocation`
+- Remembers each carrier’s last-known star system (from `CarrierLocation`, arrivals, and when you dock on it) so remote jump posts use the carrier’s location, not yours
 - Remembers tracked carriers across EDMC restarts
 - Posts a concise Discord embed with carrier, type, route, body, and timing
 - Uses Discord dynamic timestamps so departure/lockdown times show in each viewer's local timezone
@@ -17,6 +18,7 @@ Elite Dangerous Market Connector (EDMC) plugin that posts to a Discord channel w
 - Sends Discord HTTP requests on a background thread so EDMC stays responsive
 - Settings tab with delivery options, toggles, dual carrier overrides, and a **Send test message** button
 - Optional **expedition mode**: import a Spansh Fleet Carrier route CSV, bind it to one carrier, and include route progress on that carrier’s Discord jump posts
+- **Announce departure** for expedition routes (one-shot) or adhoc single jumps (destination via Spansh autocomplete)
 
 ## Requirements
 
@@ -114,16 +116,26 @@ Import a Spansh Fleet Carrier (or Spansh Tools) route CSV from the EDMC main win
 - **Progress** counts the hop underway when a jump is scheduled (first plot → `1/n`, final plot → `n/n`). Cancelling rewinds that display; only arrival permanently locks the hop and moves Next forward.
 - **Announce departure** posts a one-shot pre-departure Discord embed (delay until first jump, final destination, distance, hop count). After a successful post it stays locked for that expedition until you import or clear a route.
 
+## Adhoc pre-announcements
+
+Without an active expedition, the same **Announce departure** button posts a single-jump “departing soon” embed.
+
+- Enter how long until you jump and the **destination system** (Spansh autocomplete; you can still post a typed name if Spansh is unreachable).
+- Origin is the carrier’s last-known system when available (falls back to your current system); carrier is auto-selected when obvious, otherwise you pick from tracked carriers.
+- Anti-spam: the same carrier/origin/destination stays locked until that jump is scheduled, cancelled, completed, or the carrier leaves the origin system. A 10-minute cooldown also applies after each successful adhoc announce.
+- Scheduling the jump in-game still posts the normal “Carrier jump scheduled” embed (pre-announce does not suppress it).
+
 ## Development layout
 
 ```
 EDMC-CarrierJumpDiscord/
-  load.py         # EDMC plugin entry point
-  expedition.py   # Spansh route import and progress tracking
+  load.py                  # EDMC plugin entry point
+  expedition.py            # Spansh route import and progress tracking
+  system_autocomplete.py   # Spansh-backed destination picker for adhoc announces
   README.md
 ```
 
-Plugin version is `__version__` in `load.py` (`1.6.0`).
+Plugin version is `__version__` in `load.py` (`1.7.0-dev`).
 
 Repeat `CarrierJumpRequest` journal events for the same carrier and departure time are ignored so Discord is not spammed when the game re-emits a pending jump.
 

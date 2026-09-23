@@ -48,7 +48,7 @@ def plugin_name_guess() -> str:
 # ---------------------------------------------------------------------------
 
 PLUGIN_NAME = "Carrier Jump Discord"
-__version__ = "1.6.0"
+__version__ = "1.7.0-dev"
 
 plugin_name = os.path.basename(os.path.dirname(__file__))
 logger = logging.getLogger(f"{appname}.{plugin_name}")
@@ -63,6 +63,7 @@ if not logger.hasHandlers():
     logger.addHandler(_handler)
 
 expedition_mod = _load_local_module("expedition")
+system_ac_mod = _load_local_module("system_autocomplete")
 
 # ---------------------------------------------------------------------------
 # Config keys (unique prefix to avoid clashes)
@@ -101,6 +102,9 @@ BOT_TOKEN_RE = re.compile(r"^[\w-]+\.[\w-]+\.[\w-]+$")
 
 # Typical fleet/squadron carrier pad lockdown is ~3m20s before departure.
 LOCKDOWN_BEFORE_DEPARTURE = timedelta(minutes=3, seconds=20)
+# Adhoc pre-announce: backstop against rapid re-posts after a successful send.
+ADHOC_PREANNOUNCE_COOLDOWN = timedelta(minutes=10)
+ADHOC_STATE_FILENAME = "adhoc_preannounce_state.json"
 
 KIND_FLEET = "fleet"
 KIND_SQUADRON = "squadron"
@@ -151,7 +155,7 @@ _app_frame: Optional[tk.Frame] = None
 _current_system: Optional[str] = None
 _current_station: Optional[str] = None
 _last_cmdr: Optional[str] = None
-# carrier_id -> {name, callsign, kind, carrier_type}
+# carrier_id -> {name, callsign, kind, carrier_type, system}
 _carriers: dict[int, dict[str, str]] = {}
 # carrier_id -> latest CarrierJumpRequest entry
 _pending_jumps: dict[int, dict[str, Any]] = {}
@@ -169,6 +173,8 @@ _stop_worker = threading.Event()
 
 _plugin_dir: str = os.path.dirname(__file__)
 _expedition: Optional[Any] = None
+# Last successful adhoc pre-announce (persisted lightly for anti-spam).
+_adhoc_preannounce: dict[str, Any] = {}
 
 
 def _is_duplicate_notification(
@@ -301,6 +307,7 @@ def _load_carriers_from_config() -> None:
                 "callsign": str(value.get("callsign") or "").strip(),
                 "kind": _detect_kind(value.get("carrier_type"), str(value.get("kind") or "")),
                 "carrier_type": str(value.get("carrier_type") or "").strip(),
+                "system": str(value.get("system") or "").strip(),
             }
     _carriers = loaded
 
@@ -312,6 +319,7 @@ def _save_carriers_to_config() -> None:
             "callsign": info.get("callsign", ""),
             "kind": info.get("kind", KIND_UNKNOWN),
             "carrier_type": info.get("carrier_type", ""),
+            "system": info.get("system", ""),
         }
         for carrier_id, info in _carriers.items()
     }
@@ -328,6 +336,7 @@ def _carrier_record(carrier_id: Optional[int]) -> dict[str, str]:
             "callsign": "",
             "kind": KIND_UNKNOWN,
             "carrier_type": "",
+            "system": "",
         }
     return _carriers.get(
         carrier_id,
@@ -336,6 +345,7 @@ def _carrier_record(carrier_id: Optional[int]) -> dict[str, str]:
             "callsign": "",
             "kind": KIND_UNKNOWN,
             "carrier_type": "",
+            "system": "",
         },
     )
 
@@ -372,7 +382,11 @@ def _tracked_summary() -> str:
     for carrier_id, info in sorted(_carriers.items(), key=lambda item: item[1].get("kind", "")):
         label = _kind_label(info.get("kind") or KIND_UNKNOWN)
         display = _carrier_display(carrier_id)
-        parts.append(f"{label}: {display}")
+        system = str(info.get("system") or "").strip()
+        if system:
+            parts.append(f"{label}: {display} @ {system}")
+        else:
+            parts.append(f"{label}: {display}")
     return " | ".join(parts)
 
 
@@ -401,6 +415,7 @@ def _upsert_carrier(
     callsign: Optional[str] = None,
     carrier_type: Any = None,
     kind_hint: Optional[str] = None,
+    system: Optional[str] = None,
 ) -> Optional[int]:
     if carrier_id is None:
         return None
@@ -425,6 +440,9 @@ def _upsert_carrier(
     else:
         kind = current_kind
 
+    previous_system = str(current.get("system") or "").strip()
+    new_system = (str(system).strip() if system else "") or previous_system
+
     updated = {
         "name": (str(name).strip() if name else "") or current.get("name", ""),
         "callsign": (str(callsign).strip() if callsign else "") or current.get("callsign", ""),
@@ -434,12 +452,39 @@ def _upsert_carrier(
             if carrier_type
             else current.get("carrier_type", "")
         ),
+        "system": new_system,
     }
 
     _carriers[carrier_id] = updated
     _save_carriers_to_config()
     _refresh_tracked_label()
+    if new_system and previous_system and new_system.lower() != previous_system.lower():
+        _maybe_clear_adhoc_on_carrier_moved(carrier_id, previous_system)
+    _refresh_expedition_ui()
     return carrier_id
+
+
+def _carrier_system(carrier_id: Optional[int]) -> Optional[str]:
+    """Last-known star system for a tracked carrier, if any."""
+    system = str(_carrier_record(carrier_id).get("system") or "").strip()
+    return system or None
+
+
+def _origin_for_carrier(
+    carrier_id: Optional[int],
+    *,
+    fallback: Optional[str] = None,
+) -> str:
+    """
+    Prefer the carrier's last-known system (remote jumps), else the CMDR's
+    current system, else Unknown.
+    """
+    carrier_sys = _carrier_system(carrier_id)
+    if carrier_sys:
+        return carrier_sys
+    player = (fallback if fallback is not None else _current_system) or ""
+    player = str(player).strip()
+    return player or "Unknown"
 
 
 def _find_carrier_id_by_callsign(station_name: str) -> Optional[int]:
@@ -521,6 +566,7 @@ def _delivery_configured() -> tuple[bool, str]:
 def _refresh_ready_status() -> None:
     if not _config_bool(CFG_ENABLED, True):
         _set_status("Disabled", "orange")
+        _refresh_expedition_ui()
         return
     ok, message = _delivery_configured()
     if not ok:
@@ -529,6 +575,7 @@ def _refresh_ready_status() -> None:
         _set_status(f"Tracking {len(_carriers)} carrier(s)", "green")
     else:
         _set_status("Ready", "green")
+    _refresh_expedition_ui()
 
 
 def _post_via_webhook(payload: dict[str, Any]) -> tuple[bool, str]:
@@ -668,45 +715,44 @@ def _join_field_groups(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _refresh_expedition_ui() -> None:
-    if _expedition is None:
-        return
-    pending = _expedition_pending_destination()
-    lines = _expedition.status_lines(
-        current_system=_current_system,
-        pending_destination=pending,
-    )
-    # When collapsed, keep a bit of route context on the header line.
-    header_status = lines["status"]
-    if _expedition_collapsed and lines["status"] in (
-        "Following route",
-        "Unbound — assign a carrier",
-    ):
-        nxt = lines.get("next") or "-"
-        progress = lines.get("progress") or "-"
-        carrier = lines.get("carrier") or "-"
-        header_status = f"{lines['status']} — {carrier} · next {nxt} ({progress})"
+    if _expedition is not None:
+        pending = _expedition_pending_destination()
+        lines = _expedition.status_lines(
+            current_system=_current_system,
+            pending_destination=pending,
+        )
+        # When collapsed, keep a bit of route context on the header line.
+        header_status = lines["status"]
+        if _expedition_collapsed and lines["status"] in (
+            "Following route",
+            "Unbound — assign a carrier",
+        ):
+            nxt = lines.get("next") or "-"
+            progress = lines.get("progress") or "-"
+            carrier = lines.get("carrier") or "-"
+            header_status = f"{lines['status']} — {carrier} · next {nxt} ({progress})"
 
-    mapping = (
-        (_expedition_status_label, header_status),
-        (_expedition_carrier_label, lines.get("carrier", "-")),
-        (_expedition_final_label, lines["final"]),
-        (_expedition_next_label, lines["next"]),
-        (_expedition_progress_label, lines["progress"]),
-        (_expedition_remaining_label, lines["remaining"]),
-    )
-    for label, text in mapping:
-        if label is None:
-            continue
-        try:
-            if label.winfo_exists():
-                label["text"] = text
-        except tk.TclError:
-            pass
+        mapping = (
+            (_expedition_status_label, header_status),
+            (_expedition_carrier_label, lines.get("carrier", "-")),
+            (_expedition_final_label, lines["final"]),
+            (_expedition_next_label, lines["next"]),
+            (_expedition_progress_label, lines["progress"]),
+            (_expedition_remaining_label, lines["remaining"]),
+        )
+        for label, text in mapping:
+            if label is None:
+                continue
+            try:
+                if label.winfo_exists():
+                    label["text"] = text
+            except tk.TclError:
+                pass
 
     if _expedition_announce_btn is not None:
         try:
             if _expedition_announce_btn.winfo_exists():
-                enabled = _can_announce_pre_departure()
+                enabled = _can_announce_departure()
                 _expedition_announce_btn.configure(
                     state=tk.NORMAL if enabled else tk.DISABLED
                 )
@@ -714,8 +760,8 @@ def _refresh_expedition_ui() -> None:
             pass
 
 
-def _can_announce_pre_departure() -> bool:
-    """Whether the Announce departure button should be enabled."""
+def _is_expedition_announce_mode() -> bool:
+    """True when Announce departure should use the expedition one-shot path."""
     if _expedition is None:
         return False
     if not _expedition.state.waypoints:
@@ -724,9 +770,40 @@ def _can_announce_pre_departure() -> bool:
         return False
     if _expedition.state.completed:
         return False
-    if _expedition.state.pre_announced and not _allow_repeat_pre_announce():
-        return False
     return True
+
+
+def _can_announce_pre_departure() -> bool:
+    """Whether expedition-mode Announce departure is allowed."""
+    if not _is_expedition_announce_mode():
+        return False
+    if _expedition is not None and _expedition.state.pre_announced:
+        if not _allow_repeat_pre_announce():
+            return False
+    return True
+
+
+def _can_announce_adhoc() -> bool:
+    """Whether adhoc (non-expedition) Announce departure is allowed."""
+    if _is_expedition_announce_mode():
+        return False
+    if not _carriers:
+        return False
+    if not _config_bool(CFG_ENABLED, True):
+        return False
+    ok, _message = _delivery_configured()
+    if not ok:
+        return False
+    if _allow_repeat_pre_announce():
+        return True
+    return _adhoc_announce_allowed()
+
+
+def _can_announce_departure() -> bool:
+    """Whether the shared Announce departure button should be enabled."""
+    if _is_expedition_announce_mode():
+        return _can_announce_pre_departure()
+    return _can_announce_adhoc()
 
 
 def _expedition_pending_destination() -> Optional[str]:
@@ -806,11 +883,10 @@ def _build_expedition_pre_departure_payload(
 ) -> dict[str, Any]:
     """Narrative embed announcing an upcoming expedition departure."""
     carrier_name = _expedition_carrier_name()
-    origin = (_current_system or "").strip()
-    if not origin and _expedition is not None and _expedition.state.waypoints:
-        origin = str(_expedition.state.waypoints[0].system or "").strip()
-    if not origin:
-        origin = "Unknown"
+    bound_id = _expedition.state.carrier_id if _expedition is not None else None
+    origin = _origin_for_carrier(bound_id)
+    if origin == "Unknown" and _expedition is not None and _expedition.state.waypoints:
+        origin = str(_expedition.state.waypoints[0].system or "").strip() or "Unknown"
 
     final_dest = "Unknown"
     distance_text = "Unknown"
@@ -818,7 +894,9 @@ def _build_expedition_pre_departure_payload(
     if _expedition is not None:
         final_dest = _expedition.final_destination() or "Unknown"
         hops = _expedition.hops_total()
-        remaining = _expedition.distance_remaining(current_system=_current_system)
+        remaining = _expedition.distance_remaining(
+            current_system=_carrier_system(bound_id) or _current_system
+        )
         if remaining is not None:
             distance_text = f"{remaining:.1f} LY"
 
@@ -831,6 +909,51 @@ def _build_expedition_pre_departure_payload(
         f"and take **{hops}** jumps.\n\n"
         f"- {owner}\n\n"
         f"If you would like to join, please make your way to **{origin}** "
+        f"before departure.\n\n"
+        f"*(Departure time is approximate and potentially subject to change.)*"
+    )
+
+    mention = _config_str(CFG_MENTION).strip()
+    return {
+        "username": "EDMC Carrier Jump",
+        "content": mention or None,
+        "embeds": [
+            {
+                "title": "Carrier departing soon",
+                "description": description,
+                "color": 0x1ABC9C,
+                "footer": {"text": f"{PLUGIN_NAME} v{__version__}"},
+            }
+        ],
+    }
+
+
+def _build_adhoc_pre_departure_payload(
+    departure: datetime,
+    *,
+    carrier_id: Optional[int],
+    destination: str,
+    origin: Optional[str] = None,
+    cmdr: Optional[str] = None,
+) -> dict[str, Any]:
+    """Narrative embed announcing an upcoming single (non-expedition) jump."""
+    kind = KIND_UNKNOWN
+    if carrier_id is not None:
+        kind = _carrier_record(carrier_id).get("kind") or KIND_UNKNOWN
+    carrier_name = _carrier_display(carrier_id, kind) if carrier_id is not None else ""
+    if not carrier_name:
+        carrier_name = _kind_label(kind)
+
+    from_system = (origin or _origin_for_carrier(carrier_id)).strip() or "Unknown"
+    dest = (destination or "").strip() or "Unknown"
+    time_text = _format_discord_time(departure) or "soon"
+    owner = _owner_label(cmdr) or "CMDR"
+
+    description = (
+        f"**{carrier_name}** will be departing from **{from_system}** at {time_text} "
+        f"and heading to **{dest}**.\n\n"
+        f"- {owner}\n\n"
+        f"If you would like to join, please make your way to **{from_system}** "
         f"before departure.\n\n"
         f"*(Departure time is approximate and potentially subject to change.)*"
     )
@@ -922,6 +1045,172 @@ def _remember_cmdr(cmdr: Optional[str]) -> None:
 def _allow_repeat_pre_announce() -> bool:
     """Dev builds may re-send pre-departure announces for testing."""
     return "-dev" in __version__
+
+
+def _adhoc_state_path() -> str:
+    return os.path.join(_plugin_dir, ADHOC_STATE_FILENAME)
+
+
+def _load_adhoc_preannounce_state() -> None:
+    global _adhoc_preannounce
+    path = _adhoc_state_path()
+    if not os.path.isfile(path):
+        _adhoc_preannounce = {}
+        return
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            _adhoc_preannounce = data
+        else:
+            _adhoc_preannounce = {}
+    except Exception:
+        logger.exception("Failed loading adhoc pre-announce state from %s", path)
+        _adhoc_preannounce = {}
+
+
+def _save_adhoc_preannounce_state() -> None:
+    path = _adhoc_state_path()
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(_adhoc_preannounce, handle, indent=2)
+    except Exception:
+        logger.exception("Failed saving adhoc pre-announce state to %s", path)
+
+
+def _parse_iso_utc(raw: Any) -> Optional[datetime]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        value = datetime.fromisoformat(text)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _adhoc_locked_carrier_id() -> Optional[int]:
+    return _normalize_carrier_id(_adhoc_preannounce.get("carrier_id"))
+
+
+def _adhoc_route_key(
+    carrier_id: Optional[int],
+    origin: Optional[str],
+    destination: Optional[str],
+) -> tuple[Optional[int], str, str]:
+    return (
+        carrier_id,
+        (origin or "").strip().lower(),
+        (destination or "").strip().lower(),
+    )
+
+
+def _adhoc_cooldown_active() -> bool:
+    posted = _parse_iso_utc(_adhoc_preannounce.get("last_posted_at"))
+    if posted is None:
+        return False
+    return datetime.now(timezone.utc) < posted + ADHOC_PREANNOUNCE_COOLDOWN
+
+
+def _adhoc_is_locked() -> bool:
+    return bool(_adhoc_preannounce.get("locked"))
+
+
+def _adhoc_announce_allowed(
+    *,
+    carrier_id: Optional[int] = None,
+    origin: Optional[str] = None,
+    destination: Optional[str] = None,
+) -> bool:
+    """
+    Anti-spam gate for adhoc pre-announce.
+
+    Without a concrete route (button enable): blocked only by the global cooldown.
+    With a concrete route (confirm): also blocked when that same route is still locked
+    or when re-posting the same route during the cooldown window.
+    """
+    if _allow_repeat_pre_announce():
+        return True
+    if not _adhoc_preannounce:
+        return True
+
+    if destination is None:
+        return not _adhoc_cooldown_active()
+
+    current_origin = (origin if origin is not None else _current_system) or ""
+    locked_origin = str(_adhoc_preannounce.get("origin") or "").strip()
+    locked_dest = str(_adhoc_preannounce.get("destination") or "").strip()
+    locked_carrier = _adhoc_locked_carrier_id()
+    proposed = _adhoc_route_key(carrier_id, current_origin, destination)
+    locked = _adhoc_route_key(locked_carrier, locked_origin, locked_dest)
+
+    if proposed == locked:
+        if _adhoc_is_locked():
+            return False
+        if _adhoc_cooldown_active():
+            return False
+        return True
+
+    # Different route: global cooldown still applies as a misclick backstop.
+    return not _adhoc_cooldown_active()
+
+
+def _mark_adhoc_preannounce(
+    carrier_id: int,
+    origin: str,
+    destination: str,
+) -> None:
+    global _adhoc_preannounce
+    _adhoc_preannounce = {
+        "locked": True,
+        "carrier_id": carrier_id,
+        "origin": origin,
+        "destination": destination,
+        "last_posted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_adhoc_preannounce_state()
+
+
+def _clear_adhoc_preannounce_lock(
+    *,
+    carrier_id: Optional[int] = None,
+    reason: str = "",
+) -> None:
+    """Clear the route lock (cooldown timestamp is kept)."""
+    global _adhoc_preannounce
+    if not _adhoc_preannounce:
+        return
+    locked_carrier = _adhoc_locked_carrier_id()
+    if carrier_id is not None and locked_carrier is not None and carrier_id != locked_carrier:
+        return
+    if not _adhoc_is_locked():
+        return
+    _adhoc_preannounce["locked"] = False
+    _save_adhoc_preannounce_state()
+    if reason:
+        logger.info("Cleared adhoc pre-announce lock (%s)", reason)
+
+
+def _maybe_clear_adhoc_on_carrier_moved(
+    carrier_id: Optional[int],
+    previous_system: Optional[str],
+) -> None:
+    """Clear adhoc lock when the announced carrier leaves its locked origin."""
+    if carrier_id is None or not previous_system:
+        return
+    locked_origin = str(_adhoc_preannounce.get("origin") or "").strip()
+    if not locked_origin:
+        return
+    if locked_origin.lower() != previous_system.strip().lower():
+        return
+    _clear_adhoc_preannounce_lock(
+        carrier_id=carrier_id,
+        reason=f"carrier left origin {previous_system}",
+    )
 
 
 def _expedition_carrier_name() -> str:
@@ -1119,11 +1408,16 @@ def _is_tracked_carrier_jump(entry: dict[str, Any]) -> tuple[bool, Optional[int]
 
 def _update_carrier_from_entry(entry: dict[str, Any]) -> Optional[int]:
     carrier_id = _normalize_carrier_id(entry.get("CarrierID") or entry.get("MarketID"))
+    system = entry.get("StarSystem")
+    # CarrierJumpRequest uses SystemName for the *destination*, not current location.
+    if entry.get("event") == "CarrierJumpRequest":
+        system = None
     return _upsert_carrier(
         carrier_id,
         name=entry.get("Name") or entry.get("CarrierName"),
         callsign=entry.get("Callsign"),
         carrier_type=entry.get("CarrierType"),
+        system=system,
     )
 
 
@@ -1150,6 +1444,26 @@ def _remember_station(entry: dict[str, Any], station: Optional[str] = None) -> N
         # Undocked / in space — clear docked station hint.
         if not station:
             _current_station = None
+
+
+def _maybe_learn_carrier_system_from_presence(
+    entry: dict[str, Any],
+    system: Optional[str] = None,
+    station: Optional[str] = None,
+) -> None:
+    """
+    If the CMDR is docked on a tracked carrier, that carrier is in the current system.
+    """
+    station_name = str(entry.get("StationName") or station or "").strip()
+    if not station_name:
+        return
+    carrier_id = _find_carrier_id_by_callsign(station_name)
+    if carrier_id is None:
+        return
+    star = str(entry.get("StarSystem") or system or "").strip()
+    if not star:
+        return
+    _upsert_carrier(carrier_id, system=star)
 
 
 def _carrier_label_for_id(carrier_id: Optional[int]) -> str:
@@ -1182,6 +1496,7 @@ def _preferred_carrier_id() -> Optional[int]:
 
 def _prompt_carrier_choice(
     title: str = "Select expedition carrier",
+    prompt: str = "Which carrier is flying this expedition route?",
 ) -> Optional[tuple[int, str]]:
     """
     Modal picker listing tracked carriers.
@@ -1217,7 +1532,7 @@ def _prompt_carrier_choice(
 
     tk.Label(
         dialog,
-        text="Which carrier is flying this expedition route?",
+        text=prompt,
         justify=tk.LEFT,
     ).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(12, 8))
 
@@ -1288,6 +1603,7 @@ def plugin_start3(plugin_dir: str) -> str:
 
     _plugin_dir = plugin_dir
     _load_carriers_from_config()
+    _load_adhoc_preannounce_state()
     _expedition = expedition_mod.ExpeditionManager(
         plugin_dir,
         on_change=_refresh_expedition_ui,
@@ -1315,6 +1631,7 @@ def plugin_start3(plugin_dir: str) -> str:
 def plugin_stop() -> None:
     """Shut down background worker."""
     _save_carriers_to_config()
+    _save_adhoc_preannounce_state()
     if _expedition is not None:
         _expedition.save()
     _stop_worker.set()
@@ -1415,6 +1732,21 @@ def _clear_expedition_route() -> None:
 
 def _prompt_pre_departure_delay() -> Optional[timedelta]:
     """Ask how long until the first jump; returns None if cancelled."""
+    result = _prompt_pre_departure_details(include_destination=False)
+    if result is None:
+        return None
+    return result.get("delay")
+
+
+def _prompt_pre_departure_details(
+    *,
+    include_destination: bool,
+) -> Optional[dict[str, Any]]:
+    """
+    Shared announce dialog.
+
+    Returns {"delay": timedelta, "destination": str|None} or None if cancelled.
+    """
     parent = None
     if _app_frame is not None:
         try:
@@ -1430,10 +1762,16 @@ def _prompt_pre_departure_delay() -> Optional[timedelta]:
     dialog.resizable(False, False)
 
     result: dict[str, Any] = {"value": None}
+    dest_ac: Optional[Any] = None
 
+    prompt = (
+        "How long until you initiate the jump?"
+        if include_destination
+        else "How long until you initiate the first jump?"
+    )
     tk.Label(
         dialog,
-        text="How long until you initiate the first jump?",
+        text=prompt,
         justify=tk.LEFT,
     ).grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(12, 8))
 
@@ -1459,18 +1797,80 @@ def _prompt_pre_departure_delay() -> Optional[timedelta]:
     )
     minutes_spin.grid(row=1, column=3, sticky=tk.W, padx=(0, 12))
 
-    warning = (
-        "This action can only be performed once for this expedition."
-        if not _allow_repeat_pre_announce()
-        else "Dev build: you can send this announce more than once while testing."
-    )
+    next_row = 2
+    announce_btn: Optional[tk.Button] = None
+
+    def _destination_ready() -> bool:
+        if not include_destination:
+            return True
+        if dest_ac is None:
+            return False
+        return bool(dest_ac.get_system_name())
+
+    def _refresh_announce_btn(*_args: Any) -> None:
+        if announce_btn is None:
+            return
+        try:
+            if announce_btn.winfo_exists():
+                announce_btn.configure(
+                    state=tk.NORMAL if _destination_ready() else tk.DISABLED
+                )
+        except tk.TclError:
+            pass
+
+    if include_destination:
+        tk.Label(dialog, text="Destination:").grid(
+            row=next_row, column=0, sticky=tk.W, padx=(12, 4), pady=(8, 0)
+        )
+        dest_ac = system_ac_mod.SystemAutoCompleter(
+            dialog,
+            "System name",
+            width=36,
+            user_agent=f"EDMC-{plugin_name}/{__version__}",
+            on_select=lambda _value: _refresh_announce_btn(),
+        )
+        dest_ac.grid(
+            row=next_row,
+            column=1,
+            columnspan=3,
+            sticky=tk.EW,
+            padx=(0, 12),
+            pady=(8, 0),
+        )
+        dest_ac.var.trace_add(
+            "write",
+            lambda *_args: dialog.after_idle(_refresh_announce_btn),
+        )
+        # Reserve a row for the autocomplete dropdown.
+        next_row += 2
+
+    if include_destination:
+        if _allow_repeat_pre_announce():
+            warning = (
+                "Dev build: you can send this announce more than once while testing."
+            )
+        else:
+            warning = (
+                "Limited to one announce per destination until that jump is "
+                "scheduled, cancelled, completed, or the carrier leaves the "
+                "origin system. "
+                f"A {int(ADHOC_PREANNOUNCE_COOLDOWN.total_seconds() // 60)}-minute "
+                "cooldown also applies."
+            )
+    else:
+        warning = (
+            "This action can only be performed once for this expedition."
+            if not _allow_repeat_pre_announce()
+            else "Dev build: you can send this announce more than once while testing."
+        )
     tk.Label(
         dialog,
         text=warning,
         justify=tk.LEFT,
         wraplength=360,
         fg="#b35c00",
-    ).grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(8, 4))
+    ).grid(row=next_row, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(8, 4))
+    next_row += 1
 
     def _parse_nonneg_int(raw: str) -> Optional[int]:
         text = (raw or "").strip()
@@ -1485,6 +1885,12 @@ def _prompt_pre_departure_delay() -> Optional[timedelta]:
         return value
 
     def _confirm(_event: Optional[Any] = None) -> None:
+        if dest_ac is not None and dest_ac.lb_up:
+            dest_ac.selection()
+            _refresh_announce_btn()
+            return
+        if include_destination and not _destination_ready():
+            return
         hours = _parse_nonneg_int(hours_var.get())
         minutes = _parse_nonneg_int(minutes_var.get())
         if hours is None or minutes is None:
@@ -1507,7 +1913,31 @@ def _prompt_pre_departure_delay() -> Optional[timedelta]:
             except Exception:
                 pass
             return
-        result["value"] = timedelta(hours=hours, minutes=minutes)
+
+        destination: Optional[str] = None
+        if include_destination:
+            if dest_ac is None:
+                return
+            destination = dest_ac.get_system_name()
+            if not destination:
+                return
+            if not dest_ac.has_selected and not dest_ac.last_fetch_ok():
+                try:
+                    proceed = messagebox.askyesno(
+                        PLUGIN_NAME,
+                        "Could not verify that system with Spansh.\n\n"
+                        f"Post announce to Discord using “{destination}” as typed?",
+                        parent=dialog,
+                    )
+                except Exception:
+                    proceed = True
+                if not proceed:
+                    return
+
+        result["value"] = {
+            "delay": timedelta(hours=hours, minutes=minutes),
+            "destination": destination,
+        }
         dialog.destroy()
 
     def _cancel(_event: Optional[Any] = None) -> None:
@@ -1515,13 +1945,20 @@ def _prompt_pre_departure_delay() -> Optional[timedelta]:
         dialog.destroy()
 
     button_row = tk.Frame(dialog)
-    button_row.grid(row=3, column=0, columnspan=4, sticky=tk.E, padx=12, pady=(8, 12))
+    button_row.grid(
+        row=next_row, column=0, columnspan=4, sticky=tk.E, padx=12, pady=(8, 12)
+    )
     tk.Button(button_row, text="Cancel", command=_cancel, width=10).grid(
         row=0, column=0, padx=(0, 6)
     )
-    tk.Button(button_row, text="Announce", command=_confirm, width=10).grid(
-        row=0, column=1
+    announce_btn = tk.Button(
+        button_row,
+        text="Announce",
+        command=_confirm,
+        width=10,
+        state=tk.DISABLED if include_destination else tk.NORMAL,
     )
+    announce_btn.grid(row=0, column=1)
 
     dialog.bind("<Return>", _confirm)
     dialog.bind("<Escape>", _cancel)
@@ -1529,6 +1966,29 @@ def _prompt_pre_departure_delay() -> Optional[timedelta]:
 
     dialog.wait_window()
     return result["value"]
+
+
+def _resolve_adhoc_announce_carrier() -> Optional[tuple[int, str]]:
+    """Pick the carrier for an adhoc announce (auto or prompt)."""
+    preferred = _preferred_carrier_id()
+    if preferred is not None and len(_carriers) == 1:
+        return preferred, _carrier_label_for_id(preferred)
+    if preferred is not None and _current_station:
+        docked = _find_carrier_id_by_callsign(_current_station)
+        if docked is not None and docked == preferred:
+            return preferred, _carrier_label_for_id(preferred)
+    return _prompt_carrier_choice(
+        "Select carrier to announce",
+        prompt="Which carrier are you announcing a departure for?",
+    )
+
+
+def _announce_departure() -> None:
+    """Shared Announce departure entry: expedition or adhoc."""
+    if _is_expedition_announce_mode():
+        _announce_expedition_departure()
+    else:
+        _announce_adhoc_departure()
 
 
 def _announce_expedition_departure() -> None:
@@ -1553,8 +2013,11 @@ def _announce_expedition_departure() -> None:
             pass
         return
 
-    delay = _prompt_pre_departure_delay()
-    if delay is None:
+    details = _prompt_pre_departure_details(include_destination=False)
+    if details is None:
+        return
+    delay = details.get("delay")
+    if not isinstance(delay, timedelta):
         return
 
     departure = datetime.now(timezone.utc) + delay
@@ -1575,6 +2038,101 @@ def _announce_expedition_departure() -> None:
     logger.info("Pre-departure announce posted (%s)", message)
     if not _allow_repeat_pre_announce():
         _expedition.mark_pre_announced()
+    _set_status("Pre-departure announced", "green")
+    _refresh_expedition_ui()
+
+
+def _announce_adhoc_departure() -> None:
+    """Post a pre-departure announce for a single non-expedition jump."""
+    if not _can_announce_adhoc():
+        return
+
+    if not _config_bool(CFG_ENABLED, True):
+        _set_status("Disabled", "orange")
+        try:
+            messagebox.showinfo(PLUGIN_NAME, "Discord posting is disabled in settings.")
+        except Exception:
+            pass
+        return
+
+    ok, message = _delivery_configured()
+    if not ok:
+        _set_status(message, "orange")
+        try:
+            messagebox.showerror(PLUGIN_NAME, f"Discord delivery not ready:\n{message}")
+        except Exception:
+            pass
+        return
+
+    if not _carriers:
+        try:
+            messagebox.showerror(
+                PLUGIN_NAME,
+                "No carriers learned yet.\n\n"
+                "Open management for each carrier in-game once so names and "
+                "callsigns are tracked, then try again.",
+            )
+        except Exception:
+            pass
+        return
+
+    choice = _resolve_adhoc_announce_carrier()
+    if choice is None:
+        return
+    carrier_id, _carrier_label = choice
+
+    details = _prompt_pre_departure_details(include_destination=True)
+    if details is None:
+        return
+    delay = details.get("delay")
+    destination = str(details.get("destination") or "").strip()
+    if not isinstance(delay, timedelta) or not destination:
+        return
+
+    origin = _origin_for_carrier(carrier_id)
+    if not _adhoc_announce_allowed(
+        carrier_id=carrier_id,
+        origin=origin,
+        destination=destination,
+    ):
+        try:
+            messagebox.showinfo(
+                PLUGIN_NAME,
+                "That departure was already announced.\n\n"
+                "Wait for the jump to schedule/complete, change destination, "
+                "or wait for the cooldown before announcing again.",
+            )
+        except Exception:
+            pass
+        _refresh_expedition_ui()
+        return
+
+    departure = datetime.now(timezone.utc) + delay
+    payload = _build_adhoc_pre_departure_payload(
+        departure,
+        carrier_id=carrier_id,
+        destination=destination,
+        origin=origin,
+        cmdr=_last_cmdr,
+    )
+    ok, message = _post_discord(payload)
+    if not ok:
+        logger.error("Adhoc pre-departure announce failed: %s", message)
+        _set_status("Pre-departure announce failed", "red")
+        try:
+            messagebox.showerror(PLUGIN_NAME, f"Could not post to Discord:\n{message}")
+        except Exception:
+            pass
+        return
+
+    logger.info(
+        "Adhoc pre-departure announce posted (%s -> %s) via %s",
+        origin,
+        destination,
+        message,
+    )
+    if not _allow_repeat_pre_announce():
+        _mark_adhoc_preannounce(carrier_id, origin, destination)
     _set_status("Pre-departure announced", "green")
     _refresh_expedition_ui()
 
@@ -1699,7 +2257,7 @@ def plugin_app(parent: tk.Frame) -> tk.Frame:
     _expedition_announce_btn = tk.Button(
         buttons,
         text="Announce departure",
-        command=_announce_expedition_departure,
+        command=_announce_departure,
         state=tk.DISABLED,
     )
     _expedition_announce_btn.grid(row=0, column=3)
@@ -2083,10 +2641,20 @@ def journal_entry(
     if event in ("Location", "FSDJump", "CarrierJump", "StartUp", "Docked", "Undocked"):
         _remember_system(entry, system)
         _remember_station(entry, station)
+        if event in ("Location", "StartUp", "Docked"):
+            _maybe_learn_carrier_system_from_presence(entry, system, station)
 
     if event in ("CarrierStats", "CarrierNameChanged", "CarrierBuy", "CarrierLocation"):
         carrier_id = _update_carrier_from_entry(entry)
-        if event != "CarrierLocation":
+        if event == "CarrierLocation":
+            loc = _carrier_system(carrier_id)
+            if loc:
+                logger.info(
+                    "CarrierLocation [%s] in %s",
+                    carrier_id,
+                    loc,
+                )
+        else:
             _set_status(f"Carrier: {_carrier_display(carrier_id)}", "green")
         return None
 
@@ -2104,7 +2672,7 @@ def journal_entry(
             _last_notified_cancel.pop(carrier_id, None)
             _last_notified_arrival.pop(carrier_id, None)
 
-        from_system = _current_system or system
+        from_system = _origin_for_carrier(carrier_id, fallback=system)
         destination = entry.get("SystemName", "Unknown")
         departure = str(entry.get("DepartureTime") or "").strip()
         logger.info(
@@ -2115,6 +2683,23 @@ def journal_entry(
             departure or entry.get("DepartureTime"),
         )
         _set_status(f"Jump to {destination}", "cyan")
+
+        # Consume adhoc pre-announce lock when this schedule matches.
+        if carrier_id is not None and _adhoc_is_locked():
+            locked_carrier = _adhoc_locked_carrier_id()
+            locked_dest = str(_adhoc_preannounce.get("destination") or "").strip()
+            dest_name = str(destination or "").strip()
+            if (
+                locked_carrier == carrier_id
+                and locked_dest
+                and dest_name
+                and locked_dest.lower() == dest_name.lower()
+            ):
+                _clear_adhoc_preannounce_lock(
+                    carrier_id=carrier_id,
+                    reason="matching CarrierJumpRequest",
+                )
+
         _refresh_expedition_ui()
 
         if _config_bool(CFG_NOTIFY_REQUEST, True):
@@ -2173,6 +2758,10 @@ def journal_entry(
         if carrier_id is not None:
             _pending_jumps.pop(carrier_id, None)
             _last_notified_request.pop(carrier_id, None)
+            _clear_adhoc_preannounce_lock(
+                carrier_id=carrier_id,
+                reason="CarrierJumpCancelled",
+            )
         _refresh_expedition_ui()
         return None
 
@@ -2192,6 +2781,7 @@ def journal_entry(
                     carrier_id,
                     callsign=entry.get("StationName"),
                     carrier_type=entry.get("CarrierType") or entry.get("StationType"),
+                    system=arrived if arrived and arrived != "Unknown" else None,
                 )
         except Exception:
             logger.exception("Failed updating carrier identity on arrival")
@@ -2210,6 +2800,10 @@ def journal_entry(
         if carrier_id is not None:
             _pending_jumps.pop(carrier_id, None)
             _last_notified_request.pop(carrier_id, None)
+            _clear_adhoc_preannounce_lock(
+                carrier_id=carrier_id,
+                reason="CarrierJump arrival",
+            )
         _refresh_expedition_ui()
 
         arrival_token = f"{arrived}|{entry.get('timestamp') or ''}"
