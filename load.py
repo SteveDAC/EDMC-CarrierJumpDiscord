@@ -88,6 +88,7 @@ CFG_SQUADRON_CALLSIGN = "edmc_cjd_squadron_callsign"
 CFG_MENTION = "edmc_cjd_mention"
 CFG_CARRIERS_JSON = "edmc_cjd_carriers_json"
 CFG_EXPEDITION_COLLAPSED = "edmc_cjd_expedition_collapsed"
+CFG_PREFS_OVERRIDES_COLLAPSED = "edmc_cjd_prefs_overrides_collapsed"
 
 DELIVERY_WEBHOOK = "webhook"
 DELIVERY_BOT = "bot"
@@ -151,6 +152,13 @@ _expedition_collapse_btn: Optional[tk.Button] = None
 _expedition_announce_btn: Optional[tk.Button] = None
 _expedition_collapsed: bool = False
 _app_frame: Optional[tk.Frame] = None
+_prefs_webhook_frame: Optional[tk.Frame] = None
+_prefs_bot_frame: Optional[tk.Frame] = None
+_prefs_overrides_frame: Optional[tk.Frame] = None
+_prefs_overrides_collapse_btn: Optional[tk.Button] = None
+_prefs_tip_label: Optional[tk.Label] = None
+_prefs_overrides_collapsed: bool = True
+_prefs_delivery_trace: Optional[str] = None
 
 _current_system: Optional[str] = None
 _current_station: Optional[str] = None
@@ -2184,6 +2192,101 @@ def _toggle_expedition_collapse() -> None:
     _refresh_expedition_ui()
 
 
+def _prefs_tip_text(mode: Optional[str] = None) -> str:
+    """Short footer tip; bot mode gets invite guidance."""
+    resolved = (mode or _delivery_mode()).strip().lower()
+    if resolved == DELIVERY_BOT:
+        return (
+            "Tip: invite a bot with Send Messages + Embed Links, then paste "
+            "its token and channel ID. Open carrier management in-game once "
+            "per carrier to learn names."
+        )
+    return (
+        "Tip: open management for each carrier in-game once so names/callsigns "
+        "are learned. Unused delivery fields stay hidden until you switch mode."
+    )
+
+
+def _apply_prefs_delivery_visibility() -> None:
+    """Show webhook or bot credential fields based on the selected mode."""
+    global _prefs_webhook_frame, _prefs_bot_frame, _prefs_tip_label
+
+    mode = DELIVERY_WEBHOOK
+    if _delivery_mode_var is not None:
+        mode = _delivery_mode_var.get().strip().lower()
+        if mode not in (DELIVERY_WEBHOOK, DELIVERY_BOT):
+            mode = DELIVERY_WEBHOOK
+
+    if _prefs_webhook_frame is not None:
+        try:
+            if _prefs_webhook_frame.winfo_exists():
+                if mode == DELIVERY_WEBHOOK:
+                    _prefs_webhook_frame.grid()
+                else:
+                    _prefs_webhook_frame.grid_remove()
+        except tk.TclError:
+            _prefs_webhook_frame = None
+
+    if _prefs_bot_frame is not None:
+        try:
+            if _prefs_bot_frame.winfo_exists():
+                if mode == DELIVERY_BOT:
+                    _prefs_bot_frame.grid()
+                else:
+                    _prefs_bot_frame.grid_remove()
+        except tk.TclError:
+            _prefs_bot_frame = None
+
+    if _prefs_tip_label is not None:
+        try:
+            if _prefs_tip_label.winfo_exists():
+                _prefs_tip_label.configure(text=_prefs_tip_text(mode))
+        except tk.TclError:
+            _prefs_tip_label = None
+
+
+def _on_prefs_delivery_mode_changed(*_args: Any) -> None:
+    _apply_prefs_delivery_visibility()
+
+
+def _apply_prefs_overrides_collapse() -> None:
+    """Show or hide optional carrier override fields."""
+    global _prefs_overrides_collapse_btn, _prefs_overrides_frame
+
+    collapsed = bool(_prefs_overrides_collapsed)
+    if _prefs_overrides_collapse_btn is not None:
+        try:
+            if _prefs_overrides_collapse_btn.winfo_exists():
+                _prefs_overrides_collapse_btn.configure(
+                    text="⏵" if collapsed else "⏷"
+                )
+        except tk.TclError:
+            _prefs_overrides_collapse_btn = None
+
+    if _prefs_overrides_frame is not None:
+        try:
+            if _prefs_overrides_frame.winfo_exists():
+                if collapsed:
+                    _prefs_overrides_frame.grid_remove()
+                else:
+                    _prefs_overrides_frame.grid()
+        except tk.TclError:
+            _prefs_overrides_frame = None
+
+
+def _toggle_prefs_overrides_collapse() -> None:
+    global _prefs_overrides_collapsed
+    _prefs_overrides_collapsed = not _prefs_overrides_collapsed
+    try:
+        config.set(
+            CFG_PREFS_OVERRIDES_COLLAPSED,
+            1 if _prefs_overrides_collapsed else 0,
+        )
+    except Exception:
+        logger.debug("Failed saving prefs overrides collapse state", exc_info=True)
+    _apply_prefs_overrides_collapse()
+
+
 def plugin_app(parent: tk.Frame) -> tk.Frame:
     """Add Discord status and expedition controls to the EDMC main window."""
     global _status_label, _app_frame, _expedition_collapsed
@@ -2276,7 +2379,10 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
     global _notify_fleet_var, _notify_squadron_var
     global _fleet_name_var, _fleet_callsign_var
     global _squadron_name_var, _squadron_callsign_var, _mention_var
-    global _prefs_status, _tracked_label
+    global _prefs_status, _tracked_label, _prefs_tip_label
+    global _prefs_webhook_frame, _prefs_bot_frame, _prefs_overrides_frame
+    global _prefs_overrides_collapse_btn, _prefs_overrides_collapsed
+    global _prefs_delivery_trace
 
     _webhook_var = tk.StringVar(value=_config_str(CFG_WEBHOOK))
     _delivery_mode_var = tk.StringVar(value=_delivery_mode())
@@ -2296,6 +2402,7 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
     _squadron_name_var = tk.StringVar(value=_config_str(CFG_SQUADRON_NAME))
     _squadron_callsign_var = tk.StringVar(value=_config_str(CFG_SQUADRON_CALLSIGN))
     _mention_var = tk.StringVar(value=_config_str(CFG_MENTION))
+    _prefs_overrides_collapsed = _config_bool(CFG_PREFS_OVERRIDES_COLLAPSED, True)
 
     frame = nb.Frame(parent)
     frame.columnconfigure(1, weight=1)
@@ -2313,54 +2420,31 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
     ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
 
     row += 1
-    nb.Checkbutton(
-        frame,
-        text="Notify on jump scheduled",
-        variable=_notify_request_var,
-    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
-
-    row += 1
-    nb.Checkbutton(
-        frame,
-        text="Notify on jump cancelled",
-        variable=_notify_cancel_var,
-    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
-
-    row += 1
-    nb.Checkbutton(
-        frame,
-        text="Notify on jump arrival (when docked on your carrier)",
-        variable=_notify_arrival_var,
-    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
-
-    row += 1
-    nb.Checkbutton(
-        frame,
-        text="Notify on expedition completion",
-        variable=_notify_expedition_complete_var,
-    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
-
-    row += 1
-    nb.Checkbutton(
-        frame,
-        text="Notify for Fleet Carrier",
-        variable=_notify_fleet_var,
-    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
-
-    row += 1
-    nb.Checkbutton(
-        frame,
-        text="Notify for Squadron Carrier",
-        variable=_notify_squadron_var,
-    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
+    notify_grid = nb.Frame(frame)
+    notify_grid.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
+    notify_checks = (
+        ("Notify on jump scheduled", _notify_request_var),
+        ("Notify on jump cancelled", _notify_cancel_var),
+        ("Notify on jump arrival", _notify_arrival_var),
+        ("Notify on expedition completion", _notify_expedition_complete_var),
+        ("Notify for Fleet Carrier", _notify_fleet_var),
+        ("Notify for Squadron Carrier", _notify_squadron_var),
+    )
+    for index, (text, variable) in enumerate(notify_checks):
+        nb.Checkbutton(notify_grid, text=text, variable=variable).grid(
+            row=index // 2,
+            column=index % 2,
+            sticky=tk.W,
+            padx=(0, 16),
+            pady=1,
+        )
 
     row += 1
     nb.Label(frame, text="Delivery method").grid(
-        row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(10, 2)
+        row=row, column=0, sticky=tk.W, padx=10, pady=(8, 2)
     )
-    row += 1
     mode_row = nb.Frame(frame)
-    mode_row.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
+    mode_row.grid(row=row, column=1, sticky=tk.W, padx=10, pady=(8, 2))
     nb.Radiobutton(
         mode_row,
         text="Webhook URL",
@@ -2375,117 +2459,145 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> tk.Frame:
     ).grid(row=0, column=1, sticky=tk.W)
 
     row += 1
-    nb.Label(frame, text="Discord webhook URL").grid(
-        row=row, column=0, sticky=tk.W, padx=10, pady=(10, 2)
+    _prefs_webhook_frame = nb.Frame(frame)
+    _prefs_webhook_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, padx=0, pady=0)
+    _prefs_webhook_frame.columnconfigure(1, weight=1)
+    nb.Label(_prefs_webhook_frame, text="Discord webhook URL").grid(
+        row=0, column=0, sticky=tk.W, padx=10, pady=2
     )
-    row += 1
-    ttk.Entry(frame, textvariable=_webhook_var, width=70).grid(
-        row=row, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=2
+    ttk.Entry(_prefs_webhook_frame, textvariable=_webhook_var, width=50).grid(
+        row=0, column=1, sticky=tk.EW, padx=10, pady=2
+    )
+
+    _prefs_bot_frame = nb.Frame(frame)
+    _prefs_bot_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, padx=0, pady=0)
+    _prefs_bot_frame.columnconfigure(1, weight=1)
+    nb.Label(_prefs_bot_frame, text="Discord bot token").grid(
+        row=0, column=0, sticky=tk.W, padx=10, pady=2
+    )
+    ttk.Entry(
+        _prefs_bot_frame, textvariable=_bot_token_var, width=50, show="*"
+    ).grid(row=0, column=1, sticky=tk.EW, padx=10, pady=2)
+    nb.Label(_prefs_bot_frame, text="Discord channel ID").grid(
+        row=1, column=0, sticky=tk.W, padx=10, pady=2
+    )
+    ttk.Entry(_prefs_bot_frame, textvariable=_channel_id_var, width=40).grid(
+        row=1, column=1, sticky=tk.W, padx=10, pady=2
     )
 
     row += 1
-    nb.Label(frame, text="Discord bot token").grid(
-        row=row, column=0, sticky=tk.W, padx=10, pady=(10, 2)
+    nb.Label(frame, text="Optional mention").grid(
+        row=row, column=0, sticky=tk.W, padx=10, pady=2
     )
-    row += 1
-    ttk.Entry(frame, textvariable=_bot_token_var, width=70, show="*").grid(
-        row=row, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=2
-    )
-
-    row += 1
-    nb.Label(frame, text="Discord channel ID").grid(
-        row=row, column=0, sticky=tk.W, padx=10, pady=(8, 2)
-    )
-    row += 1
-    ttk.Entry(frame, textvariable=_channel_id_var, width=40).grid(
-        row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2
-    )
-
-    row += 1
-    nb.Label(
-        frame,
-        text="Optional mention (e.g. @here, <@&role_id>, or <@user_id>)",
-    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(10, 2))
-    row += 1
     ttk.Entry(frame, textvariable=_mention_var, width=40).grid(
-        row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2
+        row=row, column=1, sticky=tk.W, padx=10, pady=2
     )
 
     row += 1
+    overrides_header = nb.Frame(frame)
+    overrides_header.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(8, 2))
+    _prefs_overrides_collapse_btn = tk.Button(
+        overrides_header,
+        text="⏵",
+        width=2,
+        command=_toggle_prefs_overrides_collapse,
+        takefocus=0,
+    )
+    _prefs_overrides_collapse_btn.grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
     nb.Label(
-        frame,
-        text="Optional overrides (used before CarrierStats has been seen)",
-    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(10, 2))
+        overrides_header,
+        text="Optional overrides (before CarrierStats seen)",
+    ).grid(row=0, column=1, sticky=tk.W)
 
     row += 1
-    nb.Label(frame, text="Fleet Carrier name").grid(
-        row=row, column=0, sticky=tk.W, padx=10, pady=2
+    _prefs_overrides_frame = nb.Frame(frame)
+    _prefs_overrides_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW)
+    _prefs_overrides_frame.columnconfigure(1, weight=1)
+    nb.Label(_prefs_overrides_frame, text="Fleet Carrier name").grid(
+        row=0, column=0, sticky=tk.W, padx=10, pady=2
     )
-    ttk.Entry(frame, textvariable=_fleet_name_var, width=40).grid(
-        row=row, column=1, sticky=tk.W, padx=10, pady=2
+    ttk.Entry(_prefs_overrides_frame, textvariable=_fleet_name_var, width=40).grid(
+        row=0, column=1, sticky=tk.W, padx=10, pady=2
     )
-
-    row += 1
-    nb.Label(frame, text="Fleet Carrier callsign").grid(
-        row=row, column=0, sticky=tk.W, padx=10, pady=2
+    nb.Label(_prefs_overrides_frame, text="Fleet Carrier callsign").grid(
+        row=1, column=0, sticky=tk.W, padx=10, pady=2
     )
-    ttk.Entry(frame, textvariable=_fleet_callsign_var, width=20).grid(
-        row=row, column=1, sticky=tk.W, padx=10, pady=2
+    ttk.Entry(
+        _prefs_overrides_frame, textvariable=_fleet_callsign_var, width=20
+    ).grid(row=1, column=1, sticky=tk.W, padx=10, pady=2)
+    nb.Label(_prefs_overrides_frame, text="Squadron Carrier name").grid(
+        row=2, column=0, sticky=tk.W, padx=10, pady=2
     )
-
-    row += 1
-    nb.Label(frame, text="Squadron Carrier name").grid(
-        row=row, column=0, sticky=tk.W, padx=10, pady=2
+    ttk.Entry(
+        _prefs_overrides_frame, textvariable=_squadron_name_var, width=40
+    ).grid(row=2, column=1, sticky=tk.W, padx=10, pady=2)
+    nb.Label(_prefs_overrides_frame, text="Squadron Carrier callsign").grid(
+        row=3, column=0, sticky=tk.W, padx=10, pady=2
     )
-    ttk.Entry(frame, textvariable=_squadron_name_var, width=40).grid(
-        row=row, column=1, sticky=tk.W, padx=10, pady=2
-    )
-
-    row += 1
-    nb.Label(frame, text="Squadron Carrier callsign").grid(
-        row=row, column=0, sticky=tk.W, padx=10, pady=2
-    )
-    ttk.Entry(frame, textvariable=_squadron_callsign_var, width=20).grid(
-        row=row, column=1, sticky=tk.W, padx=10, pady=2
-    )
+    ttk.Entry(
+        _prefs_overrides_frame, textvariable=_squadron_callsign_var, width=20
+    ).grid(row=3, column=1, sticky=tk.W, padx=10, pady=2)
 
     row += 1
     nb.Label(frame, text="Tracked carriers").grid(
-        row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(10, 2)
+        row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(8, 2)
     )
     row += 1
-    _tracked_label = nb.Label(frame, text=_tracked_summary(), wraplength=560, justify=tk.LEFT)
+    _tracked_label = nb.Label(
+        frame, text=_tracked_summary(), wraplength=560, justify=tk.LEFT
+    )
     _tracked_label.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=2)
 
     def _on_prefs_destroy(_event: tk.Event) -> None:
-        global _tracked_label, _prefs_status
+        global _tracked_label, _prefs_status, _prefs_tip_label
+        global _prefs_webhook_frame, _prefs_bot_frame, _prefs_overrides_frame
+        global _prefs_overrides_collapse_btn, _prefs_delivery_trace
+        if (
+            _prefs_delivery_trace is not None
+            and _delivery_mode_var is not None
+        ):
+            try:
+                _delivery_mode_var.trace_remove("write", _prefs_delivery_trace)
+            except tk.TclError:
+                pass
+            _prefs_delivery_trace = None
         _tracked_label = None
         _prefs_status = None
+        _prefs_tip_label = None
+        _prefs_webhook_frame = None
+        _prefs_bot_frame = None
+        _prefs_overrides_frame = None
+        _prefs_overrides_collapse_btn = None
 
     frame.bind("<Destroy>", _on_prefs_destroy, add="+")
 
     row += 1
     button_row = nb.Frame(frame)
-    button_row.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(12, 4))
+    button_row.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(8, 4))
     nb.Button(button_row, text="Send test message", command=_send_test_message).grid(
         row=0, column=0, sticky=tk.W
     )
 
     row += 1
     _prefs_status = nb.Label(frame, text="")
-    _prefs_status.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(4, 8))
+    _prefs_status.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(2, 4))
 
     row += 1
-    nb.Label(
+    _prefs_tip_label = nb.Label(
         frame,
-        text=(
-            "Tip: open management for each carrier in-game once so names/callsigns "
-            "are learned separately. For bot mode, invite a bot with Send Messages + "
-            "Embed Links, then paste its token and the target channel ID."
-        ),
+        text=_prefs_tip_text(_delivery_mode_var.get()),
         wraplength=560,
         justify=tk.LEFT,
-    ).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(4, 10))
+    )
+    _prefs_tip_label.grid(
+        row=row, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(2, 8)
+    )
+
+    _prefs_delivery_trace = _delivery_mode_var.trace_add(
+        "write", _on_prefs_delivery_mode_changed
+    )
+    _apply_prefs_delivery_visibility()
+    _apply_prefs_overrides_collapse()
 
     return frame
 

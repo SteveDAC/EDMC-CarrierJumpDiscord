@@ -75,7 +75,7 @@ On Windows, clone into `%LOCALAPPDATA%\EDMarketConnector\plugins\EDMC-CarrierJum
 
 1. In Discord: channel settings → **Integrations → Webhooks → New Webhook** → copy the URL.
 2. In EDMC: **File → Settings → Carrier Jump Discord**
-3. Choose **Webhook URL** as the delivery method.
+3. Choose **Webhook URL** as the delivery method (bot fields stay hidden until you switch).
 4. Paste the webhook URL.
 5. Click **Send test message**.
 
@@ -85,7 +85,7 @@ On Windows, clone into `%LOCALAPPDATA%\EDMarketConnector\plugins\EDMC-CarrierJum
 2. Copy the bot token.
 3. Invite the bot to your server with at least **View Channel**, **Send Messages**, and **Embed Links**.
 4. Enable Developer Mode in Discord, right-click the target channel → **Copy Channel ID**.
-5. In EDMC settings, choose **Bot token + channel ID**.
+5. In EDMC settings, choose **Bot token + channel ID** (webhook field hides; token + channel appear).
 6. Paste the bot token and channel ID.
 7. Click **Send test message**.
 
@@ -95,7 +95,7 @@ On Windows, clone into `%LOCALAPPDATA%\EDMarketConnector\plugins\EDMC-CarrierJum
 - Notify on schedule, cancel, arrival, and/or expedition completion
 - Notify for Fleet Carrier and/or Squadron Carrier (source filter; both on by default)
 - Optional mention such as `@here`, `<@&role_id>`, or `<@user_id>`
-- Separate Fleet Carrier and Squadron Carrier name / callsign overrides
+- Optional Fleet / Squadron name and callsign overrides (collapsed by default in settings; expand when needed)
 
 **Tip:** Open management for each carrier in-game once so names and callsigns are learned independently. The settings tab shows currently tracked carriers.
 
